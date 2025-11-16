@@ -25,7 +25,14 @@
 #define STAT_FUNC stat
 #define STAT_ISDIR(mode) S_ISDIR(mode)
 #endif
+
+#if defined(ESP_PLATFORM)
+#include <Arduino.h>
+#include <Arduino_GFX_Library.h>
+#include <esp_heap_caps.h>
+#else
 #include <SDL.h>
+#endif
 
 #ifndef M_PI
 #define M_PI 3.14159265358979323846
@@ -140,12 +147,24 @@ static SpectrumMemoryPage spectrum_pages[4] = {
 
 const double CPU_CLOCK_HZ = 3500000.0;
 
-// --- SDL Globals ---
+// --- Display Globals ---
+#if !defined(ESP_PLATFORM)
 SDL_Window* window = NULL;
 SDL_Renderer* renderer = NULL;
 SDL_Texture* texture = NULL;
-uint32_t pixels[ TOTAL_WIDTH * TOTAL_HEIGHT ];
 static int window_fullscreen = 0;
+#else
+static Arduino_GFX* lcd = NULL;
+static uint16_t* lcd_framebuffers[2] = {NULL, NULL};
+static size_t lcd_framebuffer_size = 0u;
+static int lcd_backbuffer_index = 0;
+static int lcd_double_buffered = 0;
+static uint8_t lcd_framebuffer_from_psram[2] = {0u, 0u};
+static uint16_t spectrum_colors_565[8];
+static uint16_t spectrum_bright_colors_565[8];
+#endif
+
+uint32_t pixels[ TOTAL_WIDTH * TOTAL_HEIGHT ];
 
 // --- Audio Globals ---
 volatile int beeper_state = 0; // 0 = low, 1 = high
@@ -757,6 +776,84 @@ uint64_t total_t_states = 0; // A global clock for the entire CPU
 // --- ZX Spectrum Colours ---
 const uint32_t spectrum_colors[8] = {0x000000FF,0x0000CDFF,0xCD0000FF,0xCD00CDFF,0x00CD00FF,0x00CDCDFF,0xCDCD00FF,0xCFCFCFFF};
 const uint32_t spectrum_bright_colors[8] = {0x000000FF,0x0000FFFF,0xFF0000FF,0xFF00FFFF,0x00FF00FF,0x00FFFFFF,0xFFFF00FF,0xFFFFFFFF};
+
+#if defined(ESP_PLATFORM)
+static uint16_t video_rgba_to_rgb565(uint32_t rgba)
+{
+    uint8_t r = (uint8_t)((rgba >> 24) & 0xFFu);
+    uint8_t g = (uint8_t)((rgba >> 16) & 0xFFu);
+    uint8_t b = (uint8_t)((rgba >> 8) & 0xFFu);
+
+    uint16_t rr = (uint16_t)(r >> 3);
+    uint16_t gg = (uint16_t)(g >> 2);
+    uint16_t bb = (uint16_t)(b >> 3);
+
+    return (uint16_t)((rr << 11) | (gg << 5) | bb);
+}
+
+static void video_refresh_color_tables(void)
+{
+    for (int i = 0; i < 8; ++i) {
+        spectrum_colors_565[i] = video_rgba_to_rgb565(spectrum_colors[i]);
+        spectrum_bright_colors_565[i] = video_rgba_to_rgb565(spectrum_bright_colors[i]);
+    }
+}
+
+static uint16_t* video_alloc_framebuffer(size_t pixel_count, uint8_t* from_psram)
+{
+    size_t bytes = pixel_count * sizeof(uint16_t);
+    uint16_t* buffer = (uint16_t*)heap_caps_malloc(bytes, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (buffer) {
+        if (from_psram) {
+            *from_psram = 1u;
+        }
+        return buffer;
+    }
+    buffer = (uint16_t*)malloc(bytes);
+    if (from_psram) {
+        *from_psram = 0u;
+    }
+    return buffer;
+}
+
+static void video_free_framebuffers(void)
+{
+    for (int i = 0; i < 2; ++i) {
+        if (lcd_framebuffers[i]) {
+            if (lcd_framebuffer_from_psram[i]) {
+                heap_caps_free(lcd_framebuffers[i]);
+            } else {
+                free(lcd_framebuffers[i]);
+            }
+            lcd_framebuffers[i] = NULL;
+            lcd_framebuffer_from_psram[i] = 0u;
+        }
+    }
+    lcd_framebuffer_size = 0u;
+    lcd_double_buffered = 0;
+    lcd_backbuffer_index = 0;
+}
+
+static void video_convert_framebuffer(uint16_t* dest)
+{
+    if (!dest) {
+        return;
+    }
+
+    for (int y = 0; y < TOTAL_HEIGHT; ++y) {
+        const uint32_t* src_row = &pixels[y * TOTAL_WIDTH];
+        uint16_t* dst_row = &dest[y * TOTAL_WIDTH];
+        for (int x = 0; x < TOTAL_WIDTH; ++x) {
+            dst_row[x] = video_rgba_to_rgb565(src_row[x]);
+        }
+    }
+}
+
+__attribute__((weak)) Arduino_GFX* create_board_gfx(void)
+{
+    return NULL;
+}
+#endif
 
 // --- Keyboard State ---
 uint8_t keyboard_matrix[8] = {0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF};
@@ -11487,6 +11584,9 @@ static int run_z80_com_test(const char* path, const char* success_marker, char* 
 }
 
 static void toggle_fullscreen(void) {
+#if defined(ESP_PLATFORM)
+    return;
+#else
     if (!window) {
         return;
     }
@@ -11499,6 +11599,7 @@ static void toggle_fullscreen(void) {
 
     window_fullscreen = window_fullscreen ? 0 : 1;
     SDL_ShowCursor(window_fullscreen ? SDL_DISABLE : SDL_ENABLE);
+#endif
 }
 
 static int run_cpu_tests(const char* rom_dir, const char* snapshot_dir) {
@@ -11564,6 +11665,40 @@ static void print_usage(const char* prog) {
 
 // --- SDL Initialization ---
 int init_sdl(void) {
+#if defined(ESP_PLATFORM)
+    video_free_framebuffers();
+    lcd_framebuffer_size = (size_t)TOTAL_WIDTH * (size_t)TOTAL_HEIGHT * sizeof(uint16_t);
+
+    lcd_framebuffers[0] = video_alloc_framebuffer((size_t)TOTAL_WIDTH * (size_t)TOTAL_HEIGHT,
+                                                  &lcd_framebuffer_from_psram[0]);
+    lcd_framebuffers[1] = video_alloc_framebuffer((size_t)TOTAL_WIDTH * (size_t)TOTAL_HEIGHT,
+                                                  &lcd_framebuffer_from_psram[1]);
+    lcd_double_buffered = lcd_framebuffers[0] && lcd_framebuffers[1];
+    if (!lcd_framebuffers[0]) {
+        fprintf(stderr, "LCD framebuffer allocation failed (wanted %zu bytes)\n", lcd_framebuffer_size);
+        video_free_framebuffers();
+        return 0;
+    }
+
+    lcd_backbuffer_index = 0;
+    lcd = create_board_gfx();
+    if (!lcd) {
+        fprintf(stderr, "LCD driver unavailable: implement create_board_gfx() for your panel.\n");
+        video_free_framebuffers();
+        return 0;
+    }
+
+    if (!lcd->begin()) {
+        fprintf(stderr, "LCD init failed\n");
+        video_free_framebuffers();
+        return 0;
+    }
+
+    video_refresh_color_tables();
+    lcd->fillScreen(0x0000);
+    audio_available = 0;
+    return 1;
+#else
     if (SDL_Init(SDL_INIT_VIDEO | SDL_INIT_AUDIO) < 0) {
         fprintf(stderr, "SDL could not initialize! SDL_Error: %s\n", SDL_GetError()); return 0;
     }
@@ -11626,10 +11761,18 @@ int init_sdl(void) {
         }
     }
     return 1;
+#endif
 }
 
 // --- SDL Cleanup ---
 void cleanup_sdl(void) {
+#if defined(ESP_PLATFORM)
+    lcd = NULL;
+    video_free_framebuffers();
+    audio_available = 0;
+    ay_set_sample_rate(0);
+    audio_dump_finish();
+#else
     if (audio_available) {
         SDL_CloseAudio();
         audio_available = 0;
@@ -11647,6 +11790,7 @@ void cleanup_sdl(void) {
         SDL_DestroyWindow(window);
     }
     SDL_Quit();
+#endif
 }
 
 // --- Render ZX Spectrum Screen ---
@@ -11745,10 +11889,22 @@ void render_screen(void) {
     }
     tape_render_overlay();
     tape_render_manager();
+#if defined(ESP_PLATFORM)
+    if (lcd_framebuffers[lcd_backbuffer_index]) {
+        video_convert_framebuffer(lcd_framebuffers[lcd_backbuffer_index]);
+        if (lcd) {
+            lcd->draw16bitRGBBitmap(0, 0, lcd_framebuffers[lcd_backbuffer_index], TOTAL_WIDTH, TOTAL_HEIGHT);
+        }
+        if (lcd_double_buffered) {
+            lcd_backbuffer_index ^= 1;
+        }
+    }
+#else
     SDL_UpdateTexture(texture, NULL, pixels, TOTAL_WIDTH * sizeof(uint32_t));
     SDL_RenderClear(renderer);
     SDL_RenderCopy(renderer, texture, NULL, NULL);
     SDL_RenderPresent(renderer);
+#endif
 }
 
 // --- SDL Keycode to Spectrum Matrix Mapping ---
