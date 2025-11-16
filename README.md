@@ -1,18 +1,17 @@
 # Spectrum Emulator (ESP32 Port Readiness)
 
-This repository currently contains a ZX Spectrum emulator implementation (`z80.c`) that targets Intel Linux using SDL for video output. The next phase is to port the emulator to the Freenove 4.0" ESP32-S3 board (FNK0103), replacing the desktop SDL dependencies with ESP-IDF peripherals and board-specific drivers.
+This repository is being prepared for a dedicated ESP32 build targeting the Freenove 4.0" ESP32-S3 board (FNK0103). The legacy SDL desktop path has been retired in favor of ESP-IDF/Arduino peripherals and board-specific drivers.
 
 ## Current status
-- **Platform**: Intel Linux with SDL video path.
-- **Input/Audio**: Desktop keyboard handling and audio mixer tied to SDL.
-- **Goal**: Standalone ESP32 build with LCD, I2S audio, on-board input, and storage support.
+- **Platform**: SDL desktop build removed; work is centered on ESP32 bring-up for the FNK0103 board.
+- **Input/Audio**: Pending reimplementation via ESP32 GPIO/touch and I2S peripherals.
+- **Goal**: Standalone ESP32 firmware with LCD, I2S audio, on-board input, and storage support.
 
-## Host build prerequisites
-- SDL2 development headers (`libsdl2-dev` on Debian/Ubuntu).
-- Standard build essentials (`gcc`, `make`, `pkg-config`).
-- Optional: `arduino-cli` with the ESP32 core for early driver experiments.
+## ESP32 bring-up prerequisites
+- `git` and `python3` for working with the codebase and helper scripts.
+- `arduino-cli` with the Espressif ESP32 core and the TFT_eSPI library (see bootstrap below).
 
-Run `./configure` to validate that the host build dependencies and optional Arduino tooling are installed. Use `make check-env` for the same check via `make`.
+Run `./configure` (or `make check-env`) to validate that the Arduino toolchain pieces are present. The script no longer checks for SDL desktop dependencies because the host build path has been retired.
 
 ### Environment bootstrap for Arduino/ESP32 tooling
 The following steps mirror the CI/bootstrap script used for ESP32 bring-up. Run them on Debian/Ubuntu systems to prepare `arduino-cli` with the ESP32 core and TFT driver library:
@@ -46,7 +45,7 @@ arduino-cli core install esp32:esp32
 arduino-cli lib install "TFT_eSPI"
 ```
 
-After the toolchain is installed, run `make arduino-prepare` to refresh indexes and libraries, or `make arduino-build` with the appropriate `ARDUINO_FQBN` when an ESP32 sketch is available.
+After the toolchain is installed, run `make arduino-prepare` to refresh indexes and libraries, or `make arduino-build` with the appropriate `ARDUINO_FQBN` when the ESP32 firmware scaffold is in place.
 
 ## ESP32 port roadmap
 The following tasks outline the remaining work to deliver a usable ESP32 build. Each item should be kept in sync with implementation progress and any architectural changes in the emulator core.

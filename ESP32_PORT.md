@@ -1,6 +1,6 @@
 # ESP32 Port Task Breakdown
 
-The emulator currently targets Intel Linux with SDL video and desktop-oriented audio/input. Use this checklist to track the ESP32-S3 Freenove 4.0" (FNK0103) port. Update statuses and notes as work progresses.
+The desktop SDL path has been retired; all effort is focused on bringing the emulator up on the ESP32-S3 Freenove 4.0" (FNK0103) board. Use this checklist to track the port. Update statuses and notes as work progresses.
 
 ## Video: ESP32 LCD backend
 - [ ] Replace SDL video setup with the board’s LCD driver (ESP-IDF + Arduino GFX or LVGL).

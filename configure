@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Build environment checker for the Spectrum Emulator.
+# Build environment checker for the ESP32-directed Spectrum Emulator.
 
 set -euo pipefail
 
@@ -17,20 +17,14 @@ print_status() {
 
 print_hint() {
     case "$1" in
-        gcc)
-            printf "  Hint: Debian/Ubuntu -> sudo apt install build-essential\n"
-            printf "        Fedora/RHEL  -> sudo dnf install gcc make\n"
-            ;;
-        pkg-config)
-            printf "  Hint: Debian/Ubuntu -> sudo apt install pkg-config\n"
-            printf "        Fedora/RHEL  -> sudo dnf install pkgconf-pkg-config\n"
-            ;;
-        sdl2-config|sdl2)
-            printf "  Hint: Debian/Ubuntu -> sudo apt install libsdl2-dev\n"
-            printf "        Fedora/RHEL  -> sudo dnf install SDL2-devel\n"
-            ;;
         arduino-cli)
             printf "  Hint: See README for the arduino-cli install/bootstrap script.\n"
+            ;;
+        git)
+            printf "  Hint: Debian/Ubuntu -> sudo apt install git\n"
+            ;;
+        python3)
+            printf "  Hint: Debian/Ubuntu -> sudo apt install python3\n"
             ;;
     esac
 }
@@ -46,29 +40,12 @@ check_tool() {
     fi
 }
 
-check_pkg() {
-    local pkg="$1"
-    if pkg-config --exists "$pkg"; then
-        local version
-        version=$(pkg-config --modversion "$pkg" 2>/dev/null || true)
-        print_status 0 "pkg-config: $pkg (version ${version:-unknown})"
-    else
-        print_status 1 "pkg-config: $pkg not found"
-        print_hint "$pkg"
-        missing=1
-    fi
-}
-
 check_arduino_core() {
     if ! command -v arduino-cli >/dev/null 2>&1; then
         printf "[SKIP] Arduino toolchain checks skipped because arduino-cli is missing.\n"
         warn=1
         return
     fi
-
-    local core_ok lib_ok
-    core_ok=0
-    lib_ok=0
 
     if arduino-cli core list --format json 2>/dev/null | grep -q '"ID"\s*:\s*"esp32:esp32"'; then
         print_status 0 "arduino-cli esp32 core installed"
@@ -85,23 +62,15 @@ check_arduino_core() {
     fi
 }
 
-printf "Checking build prerequisites...\n"
+printf "Checking ESP32 bring-up prerequisites...\n"
 
-check_tool gcc
-check_tool pkg-config
-check_tool sdl2-config
-
-if command -v pkg-config >/dev/null 2>&1; then
-    check_pkg sdl2
-else
-    printf "[SKIP] SDL2 pkg-config check skipped because pkg-config is missing.\n"
-fi
-
+check_tool git
+check_tool python3
 check_tool arduino-cli
 check_arduino_core
 
 if [[ "$missing" -ne 0 ]]; then
-    printf "\nOne or more required tools/libraries are missing. Please install the suggested packages and rerun ./configure.\n"
+    printf "\nOne or more required tools are missing. Please install the suggested packages and rerun ./configure.\n"
     exit 1
 fi
 
@@ -109,5 +78,5 @@ if [[ "$warn" -ne 0 ]]; then
     printf "\nOptional ESP32 toolchain components were not fully detected. See README for installation steps.\n"
 fi
 
-printf "\nAll required host build tools are available. You can now run 'make' for the SDL build or use arduino-cli for ESP32 prototyping.\n"
+printf "\nPrerequisites for the ESP32 Freenove FNK0103 bring-up are available. Proceed with Arduino CLI or ESP-IDF workflows as documented.\n"
 exit 0
