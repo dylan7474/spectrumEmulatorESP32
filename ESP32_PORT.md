@@ -3,9 +3,9 @@
 The desktop SDL path has been retired; all effort is focused on bringing the emulator up on the ESP32-S3 Freenove 4.0" (FNK0103) board. Use this checklist to track the port. Update statuses and notes as work progresses.
 
 ## Video: ESP32 LCD backend
-- [ ] Replace SDL video setup with the board’s LCD driver (ESP-IDF + Arduino GFX or LVGL).
-- [ ] Decide on framebuffer strategy: double-buffered PSRAM surface vs. per-line flush.
-- [ ] Implement fast 256×192 frame + border blit, with RGB565/RGB888 conversion for the panel.
+- [x] Replace SDL video setup with the board’s LCD driver (ESP-IDF + Arduino GFX or LVGL).
+- [x] Decide on framebuffer strategy: double-buffered PSRAM surface vs. per-line flush.
+- [x] Implement fast 256×192 frame + border blit, with RGB565/RGB888 conversion for the panel.
 - [ ] Verify refresh timing and tearing behavior on hardware.
 
 ## Audio: I2S output

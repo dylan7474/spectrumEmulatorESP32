@@ -5,6 +5,7 @@ This repository is being prepared for a dedicated ESP32 build targeting the Free
 ## Current status
 - **Platform**: Centered on ESP32 bring-up for the FNK0103 board.
 - **Input/Audio**: Pending reimplementation via ESP32 GPIO/touch and I2S peripherals.
+- **Video**: LCD path implemented with an Arduino GFX-powered blit routine that converts the emulator’s RGBA buffer to the panel’s RGB565 backbuffer (double-buffered when PSRAM is available).
 - **Goal**: Standalone ESP32 firmware with LCD, I2S audio, on-board input, and storage support.
 
 ## ESP32 bring-up prerequisites
@@ -47,13 +48,19 @@ arduino-cli lib install "TFT_eSPI"
 
 After the toolchain is installed, run `make arduino-prepare` to refresh indexes and libraries, or `make arduino-build` with the appropriate `ARDUINO_FQBN` when the ESP32 firmware scaffold is in place.
 
+## LCD video backend
+ - The emulator now drives the FNK0103 LCD panel through Arduino GFX. Implement `create_board_gfx()` in your board layer to return an initialized `Arduino_GFX*` for the panel bus you are using (RGB panel helper or SPI/QSPI bridge).
+- Frame data is assembled in a 352×288 RGBA buffer (Spectrum frame plus borders) and converted to RGB565 before it is flushed to the display.
+- Two PSRAM framebuffers are allocated when possible for tear-free double buffering; if PSRAM is constrained, the code will automatically fall back to a single surface while retaining the same conversion path.
+- The tape overlay and manager continue to render into the shared RGBA buffer before each flush so that desktop and ESP32 builds remain visually aligned.
+
 ## ESP32 port roadmap
 The following tasks outline the remaining work to deliver a usable ESP32 build. Each item should be kept in sync with implementation progress and any architectural changes in the emulator core.
 
-1. **Implement ESP32 LCD video backend**
-   - Replace the SDL video pipeline with the board’s LCD driver and frame blitting routine (ESP-IDF with Arduino GFX/LVGL is recommended).
-   - Efficiently render the 256×192 frame plus borders using a double-buffered PSRAM framebuffer or a line-by-line flush strategy.
-   - Add RGB565/RGB888 conversions as needed for the panel format.
+1. **Implement ESP32 LCD video backend (done in core; verify on hardware)**
+   - SDL rendering has been replaced by an Arduino GFX-driven LCD path that converts the RGBA frame buffer to RGB565 before flushing.
+   - Default path allocates two PSRAM framebuffers for tear-free swaps, falling back to a single surface when memory is tight.
+   - Boards must supply `create_board_gfx()` to wire up the appropriate Arduino GFX panel instance; validate timing/tearing on real hardware.
 2. **Add ESP32 I2S audio output**
    - Rebuild audio output using the ESP32 I2S peripheral (on-chip DAC or external codec).
    - Port the existing beeper/AY mixer to feed a continuous I2S stream at an achievable sample rate.
