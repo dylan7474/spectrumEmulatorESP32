@@ -3,7 +3,7 @@
 This repository is being prepared for a dedicated ESP32 build targeting the Freenove 4.0" ESP32-S3 board (FNK0103). 
 
 ## Current status
-- **Platform**: SDL desktop build removed; work is centered on ESP32 bring-up for the FNK0103 board.
+- **Platform**: Centered on ESP32 bring-up for the FNK0103 board.
 - **Input/Audio**: Pending reimplementation via ESP32 GPIO/touch and I2S peripherals.
 - **Goal**: Standalone ESP32 firmware with LCD, I2S audio, on-board input, and storage support.
 
@@ -11,7 +11,7 @@ This repository is being prepared for a dedicated ESP32 build targeting the Free
 - `git` and `python3` for working with the codebase and helper scripts.
 - `arduino-cli` with the Espressif ESP32 core and the TFT_eSPI library (see bootstrap below).
 
-Run `./configure` (or `make check-env`) to validate that the Arduino toolchain pieces are present. The script no longer checks for SDL desktop dependencies because the host build path has been retired.
+Run `./configure` (or `make check-env`) to validate that the Arduino toolchain pieces are present.
 
 ### Environment bootstrap for Arduino/ESP32 tooling
 The following steps mirror the CI/bootstrap script used for ESP32 bring-up. Run them on Debian/Ubuntu systems to prepare `arduino-cli` with the ESP32 core and TFT driver library:
