@@ -1,19 +1,21 @@
-#!/bin/sh
-# Simple dependency checker for the Spectrum Emulator build.
+#!/usr/bin/env bash
+# Build environment checker for the Spectrum Emulator.
 
-set -u
+set -euo pipefail
 
 missing=0
+warn=0
 
 print_status() {
-    if [ "$1" -eq 0 ]; then
-        printf "[OK] %s\n" "$2"
+    local code="$1" msg="$2"
+    if [[ "$code" -eq 0 ]]; then
+        printf "[OK] %s\n" "$msg"
     else
-        printf "[MISSING] %s\n" "$2"
+        printf "[MISSING] %s\n" "$msg"
     fi
 }
 
-print_hints() {
+print_hint() {
     case "$1" in
         gcc)
             printf "  Hint: Debian/Ubuntu -> sudo apt install build-essential\n"
@@ -23,35 +25,63 @@ print_hints() {
             printf "  Hint: Debian/Ubuntu -> sudo apt install pkg-config\n"
             printf "        Fedora/RHEL  -> sudo dnf install pkgconf-pkg-config\n"
             ;;
-        sdl2-config)
+        sdl2-config|sdl2)
             printf "  Hint: Debian/Ubuntu -> sudo apt install libsdl2-dev\n"
             printf "        Fedora/RHEL  -> sudo dnf install SDL2-devel\n"
             ;;
-        sdl2)
-            printf "  Hint: Debian/Ubuntu -> sudo apt install libsdl2-dev\n"
-            printf "        Fedora/RHEL  -> sudo dnf install SDL2-devel\n"
+        arduino-cli)
+            printf "  Hint: See README for the arduino-cli install/bootstrap script.\n"
             ;;
     esac
 }
 
 check_tool() {
-    if command -v "$1" >/dev/null 2>&1; then
-        print_status 0 "$1 found at $(command -v "$1")"
+    local tool="$1"
+    if command -v "$tool" >/dev/null 2>&1; then
+        print_status 0 "$tool found at $(command -v "$tool")"
     else
-        print_status 1 "$1 not found"
-        print_hints "$1"
+        print_status 1 "$tool not found"
+        print_hint "$tool"
         missing=1
     fi
 }
 
 check_pkg() {
-    if pkg-config --exists "$1"; then
-        version=$(pkg-config --modversion "$1" 2>/dev/null)
-        print_status 0 "pkg-config: $1 (version ${version:-unknown})"
+    local pkg="$1"
+    if pkg-config --exists "$pkg"; then
+        local version
+        version=$(pkg-config --modversion "$pkg" 2>/dev/null || true)
+        print_status 0 "pkg-config: $pkg (version ${version:-unknown})"
     else
-        print_status 1 "pkg-config: $1 not found"
-        print_hints "$1"
+        print_status 1 "pkg-config: $pkg not found"
+        print_hint "$pkg"
         missing=1
+    fi
+}
+
+check_arduino_core() {
+    if ! command -v arduino-cli >/dev/null 2>&1; then
+        printf "[SKIP] Arduino toolchain checks skipped because arduino-cli is missing.\n"
+        warn=1
+        return
+    fi
+
+    local core_ok lib_ok
+    core_ok=0
+    lib_ok=0
+
+    if arduino-cli core list --format json 2>/dev/null | grep -q '"ID"\s*:\s*"esp32:esp32"'; then
+        print_status 0 "arduino-cli esp32 core installed"
+    else
+        print_status 1 "arduino-cli esp32 core not installed"
+        warn=1
+    fi
+
+    if arduino-cli lib list --format json 2>/dev/null | grep -qi '"Name"\s*:\s*"TFT_eSPI"'; then
+        print_status 0 "arduino-cli TFT_eSPI library installed"
+    else
+        print_status 1 "arduino-cli TFT_eSPI library not installed"
+        warn=1
     fi
 }
 
@@ -67,10 +97,17 @@ else
     printf "[SKIP] SDL2 pkg-config check skipped because pkg-config is missing.\n"
 fi
 
-if [ "$missing" -ne 0 ]; then
+check_tool arduino-cli
+check_arduino_core
+
+if [[ "$missing" -ne 0 ]]; then
     printf "\nOne or more required tools/libraries are missing. Please install the suggested packages and rerun ./configure.\n"
     exit 1
 fi
 
-printf "\nAll required build tools and libraries are available. You can now run 'make'.\n"
+if [[ "$warn" -ne 0 ]]; then
+    printf "\nOptional ESP32 toolchain components were not fully detected. See README for installation steps.\n"
+fi
+
+printf "\nAll required host build tools are available. You can now run 'make' for the SDL build or use arduino-cli for ESP32 prototyping.\n"
 exit 0

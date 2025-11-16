@@ -7,6 +7,47 @@ This repository currently contains a ZX Spectrum emulator implementation (`z80.c
 - **Input/Audio**: Desktop keyboard handling and audio mixer tied to SDL.
 - **Goal**: Standalone ESP32 build with LCD, I2S audio, on-board input, and storage support.
 
+## Host build prerequisites
+- SDL2 development headers (`libsdl2-dev` on Debian/Ubuntu).
+- Standard build essentials (`gcc`, `make`, `pkg-config`).
+- Optional: `arduino-cli` with the ESP32 core for early driver experiments.
+
+Run `./configure` to validate that the host build dependencies and optional Arduino tooling are installed. Use `make check-env` for the same check via `make`.
+
+### Environment bootstrap for Arduino/ESP32 tooling
+The following steps mirror the CI/bootstrap script used for ESP32 bring-up. Run them on Debian/Ubuntu systems to prepare `arduino-cli` with the ESP32 core and TFT driver library:
+
+```bash
+#!/bin/bash
+set -euo pipefail
+export DEBIAN_FRONTEND=noninteractive
+
+apt-get update
+apt-get install -y --no-install-recommends \
+  curl ca-certificates git python3 tar xz-utils
+
+# Proxy passthrough if required
+export HTTP_PROXY="${HTTP_PROXY:-${http_proxy:-}}"
+export HTTPS_PROXY="${HTTPS_PROXY:-${https_proxy:-$HTTP_PROXY}}"
+export NO_PROXY="${NO_PROXY:-${no_proxy:-localhost,127.0.0.1,::1}}"
+export http_proxy="$HTTP_PROXY"
+export https_proxy="$HTTPS_PROXY"
+export no_proxy="$NO_PROXY"
+
+curl -fsSL https://raw.githubusercontent.com/arduino/arduino-cli/master/install.sh | sh
+install -m 0755 bin/arduino-cli /usr/local/bin/arduino-cli
+arduino-cli config init --overwrite
+arduino-cli config set board_manager.additional_urls \
+  https://raw.githubusercontent.com/espressif/arduino-esp32/gh-pages/package_esp32_index.json
+arduino-cli config set network.proxy "${HTTPS_PROXY:-$HTTP_PROXY}" || true
+arduino-cli config set network.socket_timeout 60s || true
+arduino-cli core update-index
+arduino-cli core install esp32:esp32
+arduino-cli lib install "TFT_eSPI"
+```
+
+After the toolchain is installed, run `make arduino-prepare` to refresh indexes and libraries, or `make arduino-build` with the appropriate `ARDUINO_FQBN` when an ESP32 sketch is available.
+
 ## ESP32 port roadmap
 The following tasks outline the remaining work to deliver a usable ESP32 build. Each item should be kept in sync with implementation progress and any architectural changes in the emulator core.
 
