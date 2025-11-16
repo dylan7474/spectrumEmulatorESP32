@@ -1,6 +1,6 @@
 # Spectrum Emulator (ESP32 Port Readiness)
 
-This repository is being prepared for a dedicated ESP32 build targeting the Freenove 4.0" ESP32-S3 board (FNK0103). The legacy SDL desktop path has been retired in favor of ESP-IDF/Arduino peripherals and board-specific drivers.
+This repository is being prepared for a dedicated ESP32 build targeting the Freenove 4.0" ESP32-S3 board (FNK0103). 
 
 ## Current status
 - **Platform**: SDL desktop build removed; work is centered on ESP32 bring-up for the FNK0103 board.
