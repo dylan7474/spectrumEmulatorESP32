@@ -30,8 +30,6 @@
 #include <Arduino.h>
 #include <Arduino_GFX_Library.h>
 #include <esp_heap_caps.h>
-#else
-#include <SDL.h>
 #endif
 
 #ifndef M_PI
@@ -148,12 +146,7 @@ static SpectrumMemoryPage spectrum_pages[4] = {
 const double CPU_CLOCK_HZ = 3500000.0;
 
 // --- Display Globals ---
-#if !defined(ESP_PLATFORM)
-SDL_Window* window = NULL;
-SDL_Renderer* renderer = NULL;
-SDL_Texture* texture = NULL;
-static int window_fullscreen = 0;
-#else
+#if defined(ESP_PLATFORM)
 static Arduino_GFX* lcd = NULL;
 static uint16_t* lcd_framebuffers[2] = {NULL, NULL};
 static size_t lcd_framebuffer_size = 0u;
@@ -199,6 +192,9 @@ static const double ay_volume_table[16] = {
     0.1900, 0.2700, 0.3900, 0.5600,
     0.8000, 1.1500, 1.6500, 2.3000
 };
+
+static void audio_backend_lock(void) {}
+static void audio_backend_unlock(void) {}
 
 typedef struct {
     double tone_period[3];
@@ -538,8 +534,15 @@ typedef enum {
 #define TAPE_CONTROL_ICON_HEIGHT 7
 
 typedef struct {
+    int x;
+    int y;
+    int w;
+    int h;
+} TapeControlRect;
+
+typedef struct {
     TapeControlAction action;
-    SDL_Rect rect;
+    TapeControlRect rect;
     int enabled;
     int visible;
 } TapeControlButton;
@@ -705,10 +708,6 @@ static void tape_deck_play(uint64_t current_t_state);
 static void tape_deck_stop(uint64_t current_t_state);
 static void tape_deck_rewind(uint64_t current_t_state);
 static void tape_deck_record(uint64_t current_t_state, int append_mode);
-static int tape_handle_control_key(const SDL_Event* event);
-static int tape_handle_mouse_button(const SDL_Event* event);
-static int tape_manager_handle_event(const SDL_Event* event);
-static int tape_manager_handle_text_input(const SDL_Event* event);
 static void tape_manager_toggle(void);
 static void tape_manager_hide(void);
 static void tape_manager_show_menu(void);
@@ -730,7 +729,276 @@ static void ay_set_sample_rate(int sample_rate);
 static void ay_mix_sample(double elapsed_cycles, double* left_out, double* right_out);
 static void ay_write_register(uint8_t reg, uint8_t value);
 static int ay_parse_pan_spec(const char* spec);
-static void toggle_fullscreen(void);
+
+
+// --- LCD Initialization ---
+// TODO: Replace this generic Arduino_GFX bootstrap with the board-specific
+// panel wiring once the new LCD layer is finalized.
+int init_lcd_backend(void) {
+#if defined(ESP_PLATFORM)
+    video_free_framebuffers();
+    lcd_framebuffer_size = (size_t)TOTAL_WIDTH * (size_t)TOTAL_HEIGHT * sizeof(uint16_t);
+
+    lcd_framebuffers[0] = video_alloc_framebuffer((size_t)TOTAL_WIDTH * (size_t)TOTAL_HEIGHT,
+                                                  &lcd_framebuffer_from_psram[0]);
+    lcd_framebuffers[1] = video_alloc_framebuffer((size_t)TOTAL_WIDTH * (size_t)TOTAL_HEIGHT,
+                                                  &lcd_framebuffer_from_psram[1]);
+    lcd_double_buffered = lcd_framebuffers[0] && lcd_framebuffers[1];
+    if (!lcd_framebuffers[0]) {
+        fprintf(stderr, "LCD framebuffer allocation failed (wanted %zu bytes)
+", lcd_framebuffer_size);
+        video_free_framebuffers();
+        return 0;
+    }
+
+    lcd_backbuffer_index = 0;
+    lcd = create_board_gfx();
+    if (!lcd) {
+        fprintf(stderr, "LCD driver unavailable: implement create_board_gfx() for your panel.
+");
+        video_free_framebuffers();
+        return 0;
+    }
+
+    if (!lcd->begin()) {
+        fprintf(stderr, "LCD init failed
+");
+        video_free_framebuffers();
+        return 0;
+    }
+
+    video_refresh_color_tables();
+    lcd->fillScreen(0x0000);
+    audio_available = 0;
+    return 1;
+#else
+    fprintf(stderr, "LCD backend requested but ESP_PLATFORM is not defined.
+");
+    return 0;
+#endif
+}
+
+// --- LCD Cleanup ---
+void cleanup_lcd_backend(void) {
+#if defined(ESP_PLATFORM)
+    lcd = NULL;
+    video_free_framebuffers();
+    audio_available = 0;
+    ay_set_sample_rate(0);
+    audio_dump_finish();
+#endif
+}
+
+// --- Render ZX Spectrum Screen ---
+void render_screen(void) {
+    uint64_t frame_start = border_frame_start_tstate;
+    uint64_t frame_end = frame_start + T_STATES_PER_FRAME;
+
+    uint8_t start_color = border_frame_color & 0x07u;
+    size_t drop_count = 0;
+    while (drop_count < border_color_event_count && border_color_events[drop_count].t_state <= frame_start) {
+        start_color = border_color_events[drop_count].color_idx & 0x07u;
+        ++drop_count;
+    }
+    if (drop_count > 0) {
+        size_t remaining = border_color_event_count - drop_count;
+        if (remaining > 0) {
+            memmove(&border_color_events[0], &border_color_events[drop_count], remaining * sizeof(BorderColorEvent));
+        }
+        border_color_event_count -= drop_count;
+    }
+    border_frame_color = start_color;
+
+    uint32_t base_rgba = spectrum_colors[start_color];
+    size_t total_pixels = (size_t)TOTAL_WIDTH * (size_t)TOTAL_HEIGHT;
+    for (size_t i = 0; i < total_pixels; ++i) {
+        pixels[i] = base_rgba;
+    }
+
+    uint64_t segment_start = frame_start;
+    uint8_t current_color = start_color;
+    size_t event_index = 0;
+    while (event_index < border_color_event_count && border_color_events[event_index].t_state < frame_end) {
+        uint64_t event_time = border_color_events[event_index].t_state;
+        if (event_time > segment_start) {
+            border_draw_span(segment_start, event_time, current_color);
+        }
+        current_color = border_color_events[event_index].color_idx & 0x07u;
+        segment_start = event_time;
+        ++event_index;
+    }
+    if (frame_end > segment_start) {
+        border_draw_span(segment_start, frame_end, current_color);
+    }
+
+    if (event_index > 0) {
+        size_t remaining = border_color_event_count - event_index;
+        if (remaining > 0) {
+            memmove(&border_color_events[0], &border_color_events[event_index], remaining * sizeof(BorderColorEvent));
+        }
+        border_color_event_count = remaining;
+    }
+
+    border_frame_start_tstate = frame_end;
+    border_frame_color = current_color & 0x07u;
+
+    uint64_t frame_count = total_t_states / T_STATES_PER_FRAME;
+    int flash_phase = (int)((frame_count >> 5) & 1ULL);
+    const uint8_t* vram_bank = memory + VRAM_START;
+    const uint8_t* attr_bank = memory + ATTR_START;
+    if (current_screen_bank < 8u) {
+        if (spectrum_pages[1].type == MEMORY_PAGE_RAM && spectrum_pages[1].index == current_screen_bank) {
+            vram_bank = memory + VRAM_START;
+            attr_bank = memory + ATTR_START;
+        } else {
+            const uint8_t* bank = ram_pages[current_screen_bank];
+            vram_bank = bank;
+            attr_bank = bank + (ATTR_START - VRAM_START);
+        }
+    }
+    for (int y = 0; y < SCREEN_HEIGHT; ++y) {
+        for (int x_char = 0; x_char < SCREEN_WIDTH / 8; ++x_char) {
+            uint16_t pix_addr = VRAM_START + ((y & 0xC0) << 5) + ((y & 7) << 8) + ((y & 0x38) << 2) + x_char;
+            uint16_t attr_addr = ATTR_START + (y / 8 * 32) + x_char;
+            uint16_t pix_offset = (uint16_t)(pix_addr - VRAM_START);
+            uint16_t attr_offset = (uint16_t)(attr_addr - ATTR_START);
+            uint8_t pix_byte = vram_bank[pix_offset];
+            uint8_t attr_byte = attr_bank[attr_offset];
+            int ink_idx = attr_byte & 7;
+            int pap_idx = (attr_byte >> 3) & 7;
+            int bright = (attr_byte >> 6) & 1;
+            int flash = (attr_byte >> 7) & 1;
+            const uint32_t* cmap = bright ? spectrum_bright_colors : spectrum_colors;
+            uint32_t ink = cmap[ink_idx];
+            uint32_t pap = cmap[pap_idx];
+            if (flash && flash_phase) {
+                uint32_t tmp = ink;
+                ink = pap;
+                pap = tmp;
+            }
+            for (int bit = 0; bit < 8; ++bit) {
+                int sx = BORDER_SIZE + x_char * 8 + (7 - bit);
+                int sy = BORDER_SIZE + y;
+                pixels[sy * TOTAL_WIDTH + sx] = ((pix_byte >> bit) & 1) ? ink : pap;
+            }
+        }
+    }
+    tape_render_overlay();
+    tape_render_manager();
+#if defined(ESP_PLATFORM)
+    if (lcd_framebuffers[lcd_backbuffer_index]) {
+        video_convert_framebuffer(lcd_framebuffers[lcd_backbuffer_index]);
+        if (lcd) {
+            lcd->draw16bitRGBBitmap(0, 0, lcd_framebuffers[lcd_backbuffer_index], TOTAL_WIDTH, TOTAL_HEIGHT);
+        }
+        if (lcd_double_buffered) {
+            lcd_backbuffer_index ^= 1;
+        }
+    }
+#endif
+}
+
+// --- Audio Callback ---
+void audio_callback(void* userdata, uint8_t* stream, int len) {
+    (void)userdata;
+    int16_t* buffer = (int16_t*)stream;
+    int num_samples = len / (int)sizeof(int16_t);
+    int channels = audio_channel_count > 0 ? audio_channel_count : 1;
+    if (channels <= 0) {
+        channels = 1;
+    }
+    int num_frames = (channels > 0) ? (num_samples / channels) : 0;
+    double cycles_per_sample = beeper_cycles_per_sample;
+    double playback_position = beeper_playback_position;
+    double last_input = beeper_hp_last_input;
+    double last_output = beeper_hp_last_output;
+    int level = beeper_playback_level;
+
+    if (cycles_per_sample <= 0.0 || num_frames <= 0) {
+        memset(buffer, 0, (size_t)len);
+        return;
+    }
+
+    if (beeper_event_head == beeper_event_tail && cycles_per_sample > 0.0) {
+        double idle_cycles = playback_position - (double)beeper_last_event_t_state;
+        if (idle_cycles > 0.0) {
+            double idle_samples = idle_cycles / cycles_per_sample;
+            if (idle_samples >= BEEPER_IDLE_RESET_SAMPLES) {
+                memset(buffer, 0, (size_t)len);
+
+                double new_position = playback_position + cycles_per_sample * (double)num_frames;
+                double writer_cursor = beeper_writer_cursor;
+                double writer_lag_samples = 0.0;
+                if (cycles_per_sample > 0.0) {
+                    writer_lag_samples = (new_position - writer_cursor) / cycles_per_sample;
+                }
+
+                if (!beeper_idle_log_active) {
+                    double idle_ms = (idle_cycles / CPU_CLOCK_HZ) * 1000.0;
+                    BEEPER_LOG(
+                        "[BEEPER] idle reset #%llu after %.0f samples (idle %.2f ms, playback %.0f -> %.0f cycles, writer %llu, cursor %.0f, lag %.2f samples)
+",
+                        (unsigned long long)(beeper_idle_reset_count + 1u),
+                        idle_samples,
+                        idle_ms,
+                        playback_position,
+                        new_position,
+                        (unsigned long long)beeper_last_event_t_state,
+                        writer_cursor,
+                        writer_lag_samples);
+                    if (beeper_logging_enabled) {
+                        beeper_idle_log_active = 1;
+                        ++beeper_idle_reset_count;
+                    }
+                }
+
+                double baseline = (double)level * (double)AUDIO_AMPLITUDE;
+                last_input = baseline;
+                last_output = 0.0;
+
+                audio_dump_write_samples(buffer, (size_t)(num_frames * channels));
+                beeper_hp_last_input = last_input;
+                beeper_hp_last_output = last_output;
+                beeper_playback_position = new_position;
+                beeper_writer_cursor = writer_cursor;
+                return;
+            }
+        }
+    }
+
+    for (int i = 0; i < num_frames; ++i) {
+        double target_position = playback_position + cycles_per_sample;
+
+        while (beeper_event_head != beeper_event_tail &&
+               (double)beeper_events[beeper_event_head].t_state <= target_position) {
+            level = beeper_events[beeper_event_head].level;
+            beeper_event_head = (beeper_event_head + 1) % BEEPER_EVENT_CAPACITY;
+        }
+
+        double raw_sample = (double)level * (double)AUDIO_AMPLITUDE;
+        double filtered_sample = raw_sample - last_input + BEEPER_HP_ALPHA * last_output;
+        last_input = raw_sample;
+        last_output = filtered_sample;
+
+        int16_t sample_value = (int16_t)filtered_sample;
+        for (int ch = 0; ch < channels; ++ch) {
+            buffer[i * channels + ch] = sample_value;
+        }
+
+        playback_position = target_position;
+    }
+
+    beeper_playback_position = playback_position;
+    beeper_hp_last_input = last_input;
+    beeper_hp_last_output = last_output;
+    beeper_playback_level = level;
+
+    if (audio_dump_file && audio_dump_channels == (uint16_t)channels) {
+        audio_dump_write_samples(buffer, (size_t)(num_frames * channels));
+    }
+}
+
+
 static void ula_queue_port_value(uint8_t value);
 static void ula_process_port_events(uint64_t current_t_state);
 
@@ -1545,12 +1813,11 @@ typedef struct Z80 {
 uint8_t readByte(uint16_t addr); void writeByte(uint16_t addr, uint8_t val);
 uint16_t readWord(uint16_t addr); void writeWord(uint16_t addr, uint16_t val);
 uint8_t io_read(uint16_t port); void io_write(uint16_t port, uint8_t value);
-int cpu_step(Z80* cpu); int init_sdl(void); void cleanup_sdl(void); void render_screen(void);
-int map_sdl_key_to_spectrum(SDL_Keycode sdl_key, int* row_ptr, uint8_t* mask_ptr);
+int cpu_step(Z80* cpu); int init_lcd_backend(void); void cleanup_lcd_backend(void); void render_screen(void);
 int cpu_interrupt(Z80* cpu, uint8_t data_bus);
 int cpu_nmi(Z80* cpu);
 int cpu_ddfd_cb_step(Z80* cpu, uint16_t* index_reg, int is_ix);
-void audio_callback(void* userdata, Uint8* stream, int len);
+void audio_callback(void* userdata, uint8_t* stream, int len);
 static void border_record_event(uint64_t event_t_state, uint8_t color_idx);
 static void border_draw_span(uint64_t span_start, uint64_t span_end, uint8_t color_idx);
 static void spectrum_map_page(int segment, SpectrumMemoryPageType type, uint8_t index);
@@ -1564,7 +1831,7 @@ static void beeper_push_event(uint64_t t_state, int level);
 static size_t beeper_catch_up_to(double catch_up_position, double playback_position_snapshot);
 static double beeper_current_latency_samples(void);
 static double beeper_latency_threshold(void);
-static Uint32 beeper_recommended_throttle_delay(double latency_samples);
+static uint32_t beeper_recommended_throttle_delay(double latency_samples);
 static int audio_dump_start(const char* path, uint32_t sample_rate, uint16_t channels);
 static void audio_dump_write_samples(const Sint16* samples, size_t count);
 static void audio_dump_finish(void);
@@ -2071,7 +2338,7 @@ static double beeper_latency_threshold(void) {
     return threshold;
 }
 
-static Uint32 beeper_recommended_throttle_delay(double latency_samples) {
+static uint32_t beeper_recommended_throttle_delay(double latency_samples) {
     double threshold = beeper_latency_threshold();
     if (latency_samples <= threshold || audio_sample_rate <= 0) {
         return 0;
@@ -2098,7 +2365,7 @@ static Uint32 beeper_recommended_throttle_delay(double latency_samples) {
         estimated_ms = 8.0;
     }
 
-    return (Uint32)estimated_ms;
+    return (uint32_t)estimated_ms;
 }
 
 static double beeper_current_latency_samples(void) {
@@ -2110,10 +2377,10 @@ static double beeper_current_latency_samples(void) {
     double writer_cursor;
     double playback_position;
 
-    SDL_LockAudio();
+    audio_backend_lock();
     writer_cursor = beeper_writer_cursor;
     playback_position = beeper_playback_position;
-    SDL_UnlockAudio();
+    audio_backend_unlock();
 
     double latency_cycles = writer_cursor - playback_position;
     if (latency_cycles <= 0.0) {
@@ -4518,12 +4785,12 @@ static void ay_reset_state_internal(void) {
 static void ay_reset_state(void) {
     int locked = 0;
     if (audio_available) {
-        SDL_LockAudio();
+        audio_backend_lock();
         locked = 1;
     }
     ay_reset_state_internal();
     if (locked) {
-        SDL_UnlockAudio();
+        audio_backend_unlock();
     }
 }
 
@@ -4574,7 +4841,7 @@ static void ay_write_register(uint8_t reg, uint8_t value) {
     ay_registers[index] = value;
     int locked = 0;
     if (audio_available) {
-        SDL_LockAudio();
+        audio_backend_lock();
         locked = 1;
     }
     switch (index) {
@@ -4604,7 +4871,7 @@ static void ay_write_register(uint8_t reg, uint8_t value) {
             break;
     }
     if (locked) {
-        SDL_UnlockAudio();
+        audio_backend_unlock();
     }
 }
 
@@ -5496,17 +5763,11 @@ static void tape_manager_set_status(const char* fmt, ...) {
 }
 
 static void tape_manager_hide(void) {
-    if (tape_manager_mode == TAPE_MANAGER_MODE_FILE_INPUT) {
-        SDL_StopTextInput();
-    }
     tape_manager_mode = TAPE_MANAGER_MODE_HIDDEN;
     tape_manager_clear_input();
 }
 
 static void tape_manager_show_menu(void) {
-    if (tape_manager_mode == TAPE_MANAGER_MODE_FILE_INPUT) {
-        SDL_StopTextInput();
-    }
     tape_manager_mode = TAPE_MANAGER_MODE_MENU;
 }
 
@@ -5632,10 +5893,6 @@ static int tape_manager_refresh_browser(const char* directory) {
 }
 
 static void tape_manager_begin_browser(void) {
-    if (tape_manager_mode == TAPE_MANAGER_MODE_FILE_INPUT) {
-        SDL_StopTextInput();
-    }
-
     char initial_directory[PATH_MAX];
     initial_directory[0] = '\0';
 
@@ -5733,7 +5990,6 @@ static void tape_manager_begin_path_input(void) {
     tape_manager_input_buffer[length] = '\0';
     tape_manager_input_length = length;
     tape_manager_mode = TAPE_MANAGER_MODE_FILE_INPUT;
-    SDL_StartTextInput();
     tape_manager_set_status("ENTER TAPE PATH AND PRESS RETURN");
 }
 
@@ -5949,159 +6205,6 @@ static int tape_manager_load_path(const char* path) {
         base_name = tape_input_path ? tape_input_path : "(NONE)";
     }
     tape_manager_set_status("LOADED %s", base_name);
-    return 1;
-}
-
-static int tape_manager_handle_event(const SDL_Event* event) {
-    if (!event) {
-        return 0;
-    }
-
-    if (tape_manager_mode == TAPE_MANAGER_MODE_HIDDEN) {
-        return 0;
-    }
-
-    if (event->type == SDL_KEYUP) {
-        return 1;
-    }
-
-    if (event->type != SDL_KEYDOWN) {
-        return 0;
-    }
-
-    if (event->key.repeat) {
-        return 1;
-    }
-
-    SDL_Keycode key = event->key.keysym.sym;
-    SDL_Keymod mods = event->key.keysym.mod;
-
-    if (tape_manager_mode == TAPE_MANAGER_MODE_FILE_INPUT) {
-        switch (key) {
-            case SDLK_ESCAPE:
-                tape_manager_cancel_path_input();
-                tape_manager_set_status("LOAD CANCELLED");
-                return 1;
-            case SDLK_RETURN:
-            case SDLK_KP_ENTER:
-                tape_manager_input_buffer[tape_manager_input_length] = '\0';
-                (void)tape_manager_load_path(tape_manager_input_buffer);
-                return 1;
-            case SDLK_BACKSPACE:
-            case SDLK_DELETE:
-                if (tape_manager_input_length > 0u) {
-                    tape_manager_input_length--;
-                    tape_manager_input_buffer[tape_manager_input_length] = '\0';
-                }
-                return 1;
-            default:
-                return 1;
-        }
-    }
-
-    if (tape_manager_mode == TAPE_MANAGER_MODE_FILE_BROWSER) {
-        switch (key) {
-            case SDLK_ESCAPE:
-                tape_manager_show_menu();
-                tape_manager_set_status("BROWSE CANCELLED");
-                return 1;
-            case SDLK_RETURN:
-            case SDLK_KP_ENTER:
-                tape_manager_browser_activate_selection();
-                return 1;
-            case SDLK_UP:
-                tape_manager_browser_move_selection(-1);
-                return 1;
-            case SDLK_DOWN:
-                tape_manager_browser_move_selection(1);
-                return 1;
-            case SDLK_PAGEUP:
-                tape_manager_browser_page_selection(-1);
-                return 1;
-            case SDLK_PAGEDOWN:
-                tape_manager_browser_page_selection(1);
-                return 1;
-            case SDLK_HOME:
-                if (tape_manager_browser_entry_count > 0) {
-                    tape_manager_browser_selection = 0;
-                    tape_manager_browser_clamp_selection();
-                }
-                return 1;
-            case SDLK_END:
-                if (tape_manager_browser_entry_count > 0) {
-                    tape_manager_browser_selection = tape_manager_browser_entry_count - 1;
-                    tape_manager_browser_clamp_selection();
-                }
-                return 1;
-            case SDLK_BACKSPACE:
-                tape_manager_browser_go_parent();
-                return 1;
-            default:
-                return 1;
-        }
-    }
-
-    switch (key) {
-        case SDLK_ESCAPE:
-            tape_manager_hide();
-            return 1;
-        case SDLK_l:
-            tape_manager_begin_path_input();
-            return 1;
-        case SDLK_b:
-            tape_manager_begin_browser();
-            return 1;
-        case SDLK_e:
-            tape_manager_eject_tape();
-            return 1;
-        case SDLK_p:
-            tape_deck_play(total_t_states);
-            tape_manager_set_status("PLAY COMMAND SENT");
-            return 1;
-        case SDLK_s:
-            tape_deck_stop(total_t_states);
-            tape_manager_set_status("STOP COMMAND SENT");
-            return 1;
-        case SDLK_w:
-            tape_deck_rewind(total_t_states);
-            tape_manager_set_status("REWIND COMMAND SENT");
-            return 1;
-        case SDLK_r:
-            tape_deck_record(total_t_states, (mods & KMOD_SHIFT) ? 1 : 0);
-            if (tape_recorder.recording) {
-                if (mods & KMOD_SHIFT) {
-                    tape_manager_set_status("APPEND RECORDING ACTIVE");
-                } else {
-                    tape_manager_set_status("RECORDING ACTIVE");
-                }
-            } else if (tape_recorder.enabled) {
-                tape_manager_set_status("RECORD COMMAND SENT");
-            } else {
-                tape_manager_set_status("NO RECORDER OUTPUT CONFIGURED");
-            }
-            return 1;
-        default:
-            return 1;
-    }
-}
-
-static int tape_manager_handle_text_input(const SDL_Event* event) {
-    if (!event || event->type != SDL_TEXTINPUT) {
-        return 0;
-    }
-
-    if (tape_manager_mode != TAPE_MANAGER_MODE_FILE_INPUT) {
-        return 0;
-    }
-
-    const char* text = event->text.text;
-    while (text && *text) {
-        if (tape_manager_input_length + 1u < sizeof(tape_manager_input_buffer)) {
-            tape_manager_input_buffer[tape_manager_input_length++] = *text;
-            tape_manager_input_buffer[tape_manager_input_length] = '\0';
-        }
-        ++text;
-    }
     return 1;
 }
 
@@ -8278,134 +8381,6 @@ static void tape_deck_record(uint64_t current_t_state, int append_mode) {
     }
 }
 
-static int tape_handle_control_key(const SDL_Event* event) {
-    if (!event || (event->type != SDL_KEYDOWN && event->type != SDL_KEYUP)) {
-        return 0;
-    }
-
-    SDL_Keycode key = event->key.keysym.sym;
-    if (key == SDLK_TAB) {
-        if (event->type == SDL_KEYDOWN && !event->key.repeat) {
-            tape_manager_toggle();
-        }
-        return 1;
-    }
-
-    if (key != SDLK_F5 && key != SDLK_F6 && key != SDLK_F7 && key != SDLK_F8) {
-        return 0;
-    }
-
-    if (event->type == SDL_KEYDOWN) {
-        if (event->key.repeat) {
-            return 1;
-        }
-        int append_mode = (event->key.keysym.mod & KMOD_SHIFT) ? 1 : 0;
-        switch (key) {
-            case SDLK_F5:
-                tape_deck_play(total_t_states);
-                break;
-            case SDLK_F6:
-                tape_deck_stop(total_t_states);
-                break;
-            case SDLK_F7:
-                tape_deck_rewind(total_t_states);
-                break;
-            case SDLK_F8:
-                tape_deck_record(total_t_states, append_mode);
-                break;
-            default:
-                break;
-        }
-    }
-
-    return 1;
-}
-
-static int tape_handle_mouse_button(const SDL_Event* event) {
-    if (!event || event->type != SDL_MOUSEBUTTONDOWN) {
-        return 0;
-    }
-
-    if (event->button.button != SDL_BUTTON_LEFT) {
-        return 0;
-    }
-
-    if (tape_control_button_count <= 0) {
-        return 0;
-    }
-
-    int mouse_x = event->button.x;
-    int mouse_y = event->button.y;
-
-    for (int i = 0; i < tape_control_button_count; ++i) {
-        TapeControlButton* button = &tape_control_buttons[i];
-        if (!button->visible) {
-            continue;
-        }
-
-        int left = button->rect.x;
-        int top = button->rect.y;
-        int right = left + button->rect.w;
-        int bottom = top + button->rect.h;
-
-        if (mouse_x < left || mouse_x >= right || mouse_y < top || mouse_y >= bottom) {
-            continue;
-        }
-
-        if (!button->enabled) {
-            return 1;
-        }
-
-        switch (button->action) {
-            case TAPE_CONTROL_ACTION_PLAY:
-                tape_deck_play(total_t_states);
-                if (tape_manager_mode != TAPE_MANAGER_MODE_HIDDEN) {
-                    tape_manager_set_status("PLAY COMMAND SENT");
-                }
-                break;
-            case TAPE_CONTROL_ACTION_STOP:
-                tape_deck_stop(total_t_states);
-                if (tape_manager_mode != TAPE_MANAGER_MODE_HIDDEN) {
-                    tape_manager_set_status("STOP COMMAND SENT");
-                }
-                break;
-            case TAPE_CONTROL_ACTION_REWIND:
-                tape_deck_rewind(total_t_states);
-                if (tape_manager_mode != TAPE_MANAGER_MODE_HIDDEN) {
-                    tape_manager_set_status("REWIND COMMAND SENT");
-                }
-                break;
-            case TAPE_CONTROL_ACTION_RECORD:
-                {
-                    SDL_Keymod mods = SDL_GetModState();
-                    int append_mode = (mods & KMOD_SHIFT) ? 1 : 0;
-                    tape_deck_record(total_t_states, append_mode);
-                    if (tape_manager_mode != TAPE_MANAGER_MODE_HIDDEN) {
-                        if (tape_recorder.recording) {
-                            if (append_mode) {
-                                tape_manager_set_status("APPEND RECORDING ACTIVE");
-                            } else {
-                                tape_manager_set_status("RECORDING ACTIVE");
-                            }
-                        } else if (tape_recorder.enabled) {
-                            tape_manager_set_status("RECORD COMMAND SENT");
-                        } else {
-                            tape_manager_set_status("NO RECORDER OUTPUT CONFIGURED");
-                        }
-                    }
-                }
-                break;
-            case TAPE_CONTROL_ACTION_NONE:
-            default:
-                break;
-        }
-
-        return 1;
-    }
-
-    return 0;
-}
-
 static size_t beeper_catch_up_to(double catch_up_position, double playback_position_snapshot) {
     if (beeper_cycles_per_sample <= 0.0) {
         return 0;
@@ -8481,7 +8456,7 @@ static size_t beeper_catch_up_to(double catch_up_position, double playback_posit
 static void beeper_push_event(uint64_t t_state, int level) {
     int locked_audio = 0;
     if (audio_available) {
-        SDL_LockAudio();
+        audio_backend_lock();
         locked_audio = 1;
     }
 
@@ -8648,7 +8623,7 @@ static void beeper_push_event(uint64_t t_state, int level) {
     beeper_event_tail = next_tail;
 
     if (locked_audio) {
-        SDL_UnlockAudio();
+        audio_backend_unlock();
     }
 }
 
@@ -11583,1161 +11558,6 @@ static int run_z80_com_test(const char* path, const char* success_marker, char* 
     return 1;
 }
 
-static void toggle_fullscreen(void) {
-#if defined(ESP_PLATFORM)
-    return;
-#else
-    if (!window) {
-        return;
-    }
-
-    Uint32 flags = window_fullscreen ? 0u : SDL_WINDOW_FULLSCREEN_DESKTOP;
-    if (SDL_SetWindowFullscreen(window, flags) != 0) {
-        fprintf(stderr, "Failed to toggle fullscreen: %s\n", SDL_GetError());
-        return;
-    }
-
-    window_fullscreen = window_fullscreen ? 0 : 1;
-    SDL_ShowCursor(window_fullscreen ? SDL_DISABLE : SDL_ENABLE);
-#endif
-}
-
-static int run_cpu_tests(const char* rom_dir, const char* snapshot_dir) {
-    bool unit_pass = run_unit_tests();
-    bool snapshot_pass = run_snapshot_tests(snapshot_dir);
-    bool overall = unit_pass && snapshot_pass;
-
-    const struct {
-        const char* filename;
-        const char* marker;
-        const char* label;
-    } optional_tests[] = {
-        {"zexdoc.com", "ZEXDOC", "ZEXDOC"},
-        {"zexall.com", "ZEXALL", "ZEXALL"},
-        {"z80full.com", NULL, "Z80FULL"},
-    };
-
-    char full_path[512];
-    char output_log[32768];
-
-    for (size_t i = 0; i < sizeof(optional_tests)/sizeof(optional_tests[0]); ++i) {
-        int required = 0;
-        if (rom_dir && rom_dir[0] != '\0') {
-            required = snprintf(full_path, sizeof(full_path), "%s/%s", rom_dir, optional_tests[i].filename);
-        } else {
-            required = snprintf(full_path, sizeof(full_path), "%s", optional_tests[i].filename);
-        }
-        if (required < 0 || (size_t)required >= sizeof(full_path)) {
-            fprintf(stderr, "Skipping %s (path too long)\n", optional_tests[i].label);
-            continue;
-        }
-        int result = run_z80_com_test(full_path, optional_tests[i].marker, output_log, sizeof(output_log));
-        if (result == -1) {
-            printf("Skipping %s (missing %s)\n", optional_tests[i].label, full_path);
-            continue;
-        }
-        if (result == 1) {
-            printf("%s test PASS\n", optional_tests[i].label);
-        } else {
-            printf("%s test FAIL\n", optional_tests[i].label);
-            printf("Output:\n%s\n", output_log);
-            overall = false;
-        }
-    }
-
-    return overall ? 0 : 1;
-}
-
-static void print_usage(const char* prog) {
-    fprintf(stderr,
-            "Usage: %s [--audio-dump <wav_file>] [--beeper-log] [--tape-debug] [--paging-log] [--paging-log-regs] [--ram-hash-log] "
-            "[--model <48k|128k|plus2a|plus3> | --48k | --128k | --plus2a | --plus3] "
-            "[--contention <48k|128k|plus2a|plus3>] "
-            "[--peripheral <none|if1|plus3>] "
-            "[--ay-gain <multiplier>] [--ay-pan <left,center,right>] "
-            "[--tap <tap_file> | --tzx <tzx_file> | --wav <wav_file>] "
-            "[--snapshot <sna_or_z80>] "
-            "[--save-tap <tap_file> | --save-wav <wav_file>] "
-            "[--test-rom-dir <dir>] [--snapshot-test-dir <dir>] "
-            "[--run-tests] [--fullscreen] [rom_file]\n",
-            prog);
-}
-
-// --- SDL Initialization ---
-int init_sdl(void) {
-#if defined(ESP_PLATFORM)
-    video_free_framebuffers();
-    lcd_framebuffer_size = (size_t)TOTAL_WIDTH * (size_t)TOTAL_HEIGHT * sizeof(uint16_t);
-
-    lcd_framebuffers[0] = video_alloc_framebuffer((size_t)TOTAL_WIDTH * (size_t)TOTAL_HEIGHT,
-                                                  &lcd_framebuffer_from_psram[0]);
-    lcd_framebuffers[1] = video_alloc_framebuffer((size_t)TOTAL_WIDTH * (size_t)TOTAL_HEIGHT,
-                                                  &lcd_framebuffer_from_psram[1]);
-    lcd_double_buffered = lcd_framebuffers[0] && lcd_framebuffers[1];
-    if (!lcd_framebuffers[0]) {
-        fprintf(stderr, "LCD framebuffer allocation failed (wanted %zu bytes)\n", lcd_framebuffer_size);
-        video_free_framebuffers();
-        return 0;
-    }
-
-    lcd_backbuffer_index = 0;
-    lcd = create_board_gfx();
-    if (!lcd) {
-        fprintf(stderr, "LCD driver unavailable: implement create_board_gfx() for your panel.\n");
-        video_free_framebuffers();
-        return 0;
-    }
-
-    if (!lcd->begin()) {
-        fprintf(stderr, "LCD init failed\n");
-        video_free_framebuffers();
-        return 0;
-    }
-
-    video_refresh_color_tables();
-    lcd->fillScreen(0x0000);
-    audio_available = 0;
-    return 1;
-#else
-    if (SDL_Init(SDL_INIT_VIDEO | SDL_INIT_AUDIO) < 0) {
-        fprintf(stderr, "SDL could not initialize! SDL_Error: %s\n", SDL_GetError()); return 0;
-    }
-    window = SDL_CreateWindow("ZX Spectrum Emulator", SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED, TOTAL_WIDTH * DISPLAY_SCALE, TOTAL_HEIGHT * DISPLAY_SCALE, SDL_WINDOW_SHOWN);
-    if (!window) { fprintf(stderr, "Window Error: %s\n", SDL_GetError()); return 0; }
-    renderer = SDL_CreateRenderer(window, -1, SDL_RENDERER_ACCELERATED | SDL_RENDERER_PRESENTVSYNC);
-    if (!renderer) { fprintf(stderr, "Renderer Error: %s\n", SDL_GetError()); return 0; }
-    texture = SDL_CreateTexture(renderer, SDL_PIXELFORMAT_RGBA8888, SDL_TEXTUREACCESS_STREAMING, TOTAL_WIDTH, TOTAL_HEIGHT);
-    if (!texture) { fprintf(stderr, "Texture Error: %s\n", SDL_GetError()); return 0; }
-    SDL_RenderSetLogicalSize(renderer, TOTAL_WIDTH, TOTAL_HEIGHT);
-
-    SDL_AudioSpec wanted_spec, have_spec;
-    SDL_zero(wanted_spec);
-    wanted_spec.freq = 44100;
-    wanted_spec.format = AUDIO_S16SYS;
-    wanted_spec.channels = 2;
-    wanted_spec.samples = 512;
-    wanted_spec.callback = audio_callback;
-    wanted_spec.userdata = NULL;
-
-    if (SDL_OpenAudio(&wanted_spec, &have_spec) < 0) {
-        fprintf(stderr, "Failed to open audio: %s\n", SDL_GetError());
-        ay_set_sample_rate(0);
-        beeper_set_latency_limit(256.0);
-    } else {
-        if (have_spec.format != AUDIO_S16SYS || have_spec.channels < 1 || have_spec.channels > 2) {
-            fprintf(stderr, "Unexpected audio format (format=%d, channels=%d). Audio disabled.\n", have_spec.format, have_spec.channels);
-            SDL_CloseAudio();
-            ay_set_sample_rate(0);
-            beeper_set_latency_limit(256.0);
-        } else {
-            audio_sample_rate = have_spec.freq > 0 ? have_spec.freq : wanted_spec.freq;
-            ay_set_sample_rate(audio_sample_rate);
-            audio_channel_count = (have_spec.channels > 0) ? have_spec.channels : wanted_spec.channels;
-            if (audio_channel_count <= 0) {
-                audio_channel_count = 1;
-            }
-            audio_available = 1;
-            beeper_cycles_per_sample = CPU_CLOCK_HZ / (double)audio_sample_rate;
-            double latency_limit = have_spec.samples > 0 ? (double)have_spec.samples : (double)wanted_spec.samples;
-            if (latency_limit < 256.0) {
-                latency_limit = 256.0;
-            }
-            beeper_set_latency_limit(latency_limit);
-            BEEPER_LOG(
-                "[BEEPER] latency clamp set to %.0f samples (audio buffer %u, throttle %.0f, trim %.0f)\n",
-                beeper_max_latency_samples,
-                have_spec.samples > 0 ? have_spec.samples : wanted_spec.samples,
-                beeper_latency_threshold(),
-                beeper_latency_trim_samples);
-            beeper_reset_audio_state(total_t_states, speaker_output_level);
-            if (audio_dump_path && !audio_dump_file) {
-                if (!audio_dump_start(audio_dump_path,
-                                      (uint32_t)audio_sample_rate,
-                                      (uint16_t)audio_channel_count)) {
-                    audio_dump_path = NULL;
-                }
-            }
-            SDL_PauseAudio(0); // Start playing sound
-        }
-    }
-    return 1;
-#endif
-}
-
-// --- SDL Cleanup ---
-void cleanup_sdl(void) {
-#if defined(ESP_PLATFORM)
-    lcd = NULL;
-    video_free_framebuffers();
-    audio_available = 0;
-    ay_set_sample_rate(0);
-    audio_dump_finish();
-#else
-    if (audio_available) {
-        SDL_CloseAudio();
-        audio_available = 0;
-        beeper_set_latency_limit(256.0);
-    }
-    ay_set_sample_rate(0);
-    audio_dump_finish();
-    if (texture) {
-        SDL_DestroyTexture(texture);
-    }
-    if (renderer) {
-        SDL_DestroyRenderer(renderer);
-    }
-    if (window) {
-        SDL_DestroyWindow(window);
-    }
-    SDL_Quit();
-#endif
-}
-
-// --- Render ZX Spectrum Screen ---
-void render_screen(void) {
-    uint64_t frame_start = border_frame_start_tstate;
-    uint64_t frame_end = frame_start + T_STATES_PER_FRAME;
-
-    uint8_t start_color = border_frame_color & 0x07u;
-    size_t drop_count = 0;
-    while (drop_count < border_color_event_count && border_color_events[drop_count].t_state <= frame_start) {
-        start_color = border_color_events[drop_count].color_idx & 0x07u;
-        ++drop_count;
-    }
-    if (drop_count > 0) {
-        size_t remaining = border_color_event_count - drop_count;
-        if (remaining > 0) {
-            memmove(&border_color_events[0], &border_color_events[drop_count], remaining * sizeof(BorderColorEvent));
-        }
-        border_color_event_count -= drop_count;
-    }
-    border_frame_color = start_color;
-
-    uint32_t base_rgba = spectrum_colors[start_color];
-    size_t total_pixels = (size_t)TOTAL_WIDTH * (size_t)TOTAL_HEIGHT;
-    for (size_t i = 0; i < total_pixels; ++i) {
-        pixels[i] = base_rgba;
-    }
-
-    uint64_t segment_start = frame_start;
-    uint8_t current_color = start_color;
-    size_t event_index = 0;
-    while (event_index < border_color_event_count && border_color_events[event_index].t_state < frame_end) {
-        uint64_t event_time = border_color_events[event_index].t_state;
-        if (event_time > segment_start) {
-            border_draw_span(segment_start, event_time, current_color);
-        }
-        current_color = border_color_events[event_index].color_idx & 0x07u;
-        segment_start = event_time;
-        ++event_index;
-    }
-    if (frame_end > segment_start) {
-        border_draw_span(segment_start, frame_end, current_color);
-    }
-
-    if (event_index > 0) {
-        size_t remaining = border_color_event_count - event_index;
-        if (remaining > 0) {
-            memmove(&border_color_events[0], &border_color_events[event_index], remaining * sizeof(BorderColorEvent));
-        }
-        border_color_event_count = remaining;
-    }
-
-    border_frame_start_tstate = frame_end;
-    border_frame_color = current_color & 0x07u;
-
-    uint64_t frame_count = total_t_states / T_STATES_PER_FRAME;
-    int flash_phase = (int)((frame_count >> 5) & 1ULL);
-    const uint8_t* vram_bank = memory + VRAM_START;
-    const uint8_t* attr_bank = memory + ATTR_START;
-    if (current_screen_bank < 8u) {
-        if (spectrum_pages[1].type == MEMORY_PAGE_RAM && spectrum_pages[1].index == current_screen_bank) {
-            vram_bank = memory + VRAM_START;
-            attr_bank = memory + ATTR_START;
-        } else {
-            const uint8_t* bank = ram_pages[current_screen_bank];
-            vram_bank = bank;
-            attr_bank = bank + (ATTR_START - VRAM_START);
-        }
-    }
-    for (int y = 0; y < SCREEN_HEIGHT; ++y) {
-        for (int x_char = 0; x_char < SCREEN_WIDTH / 8; ++x_char) {
-            uint16_t pix_addr = VRAM_START + ((y & 0xC0) << 5) + ((y & 7) << 8) + ((y & 0x38) << 2) + x_char;
-            uint16_t attr_addr = ATTR_START + (y / 8 * 32) + x_char;
-            uint16_t pix_offset = (uint16_t)(pix_addr - VRAM_START);
-            uint16_t attr_offset = (uint16_t)(attr_addr - ATTR_START);
-            uint8_t pix_byte = vram_bank[pix_offset];
-            uint8_t attr_byte = attr_bank[attr_offset];
-            int ink_idx = attr_byte & 7;
-            int pap_idx = (attr_byte >> 3) & 7;
-            int bright = (attr_byte >> 6) & 1;
-            int flash = (attr_byte >> 7) & 1;
-            const uint32_t* cmap = bright ? spectrum_bright_colors : spectrum_colors;
-            uint32_t ink = cmap[ink_idx];
-            uint32_t pap = cmap[pap_idx];
-            if (flash && flash_phase) {
-                uint32_t tmp = ink;
-                ink = pap;
-                pap = tmp;
-            }
-            for (int bit = 0; bit < 8; ++bit) {
-                int sx = BORDER_SIZE + x_char * 8 + (7 - bit);
-                int sy = BORDER_SIZE + y;
-                pixels[sy * TOTAL_WIDTH + sx] = ((pix_byte >> bit) & 1) ? ink : pap;
-            }
-        }
-    }
-    tape_render_overlay();
-    tape_render_manager();
-#if defined(ESP_PLATFORM)
-    if (lcd_framebuffers[lcd_backbuffer_index]) {
-        video_convert_framebuffer(lcd_framebuffers[lcd_backbuffer_index]);
-        if (lcd) {
-            lcd->draw16bitRGBBitmap(0, 0, lcd_framebuffers[lcd_backbuffer_index], TOTAL_WIDTH, TOTAL_HEIGHT);
-        }
-        if (lcd_double_buffered) {
-            lcd_backbuffer_index ^= 1;
-        }
-    }
-#else
-    SDL_UpdateTexture(texture, NULL, pixels, TOTAL_WIDTH * sizeof(uint32_t));
-    SDL_RenderClear(renderer);
-    SDL_RenderCopy(renderer, texture, NULL, NULL);
-    SDL_RenderPresent(renderer);
-#endif
-}
-
-// --- SDL Keycode to Spectrum Matrix Mapping ---
-int map_sdl_key_to_spectrum(SDL_Keycode k, int* r, uint8_t* m) {
-    if(k==SDLK_LSHIFT||k==SDLK_RSHIFT){*r=0;*m=0x01;return 1;} if(k==SDLK_z){*r=0;*m=0x02;return 1;} if(k==SDLK_x){*r=0;*m=0x04;return 1;} if(k==SDLK_c){*r=0;*m=0x08;return 1;} if(k==SDLK_v){*r=0;*m=0x10;return 1;}
-    if(k==SDLK_a){*r=1;*m=0x01;return 1;} if(k==SDLK_s){*r=1;*m=0x02;return 1;} if(k==SDLK_d){*r=1;*m=0x04;return 1;} if(k==SDLK_f){*r=1;*m=0x08;return 1;} if(k==SDLK_g){*r=1;*m=0x10;return 1;}
-    if(k==SDLK_q){*r=2;*m=0x01;return 1;} if(k==SDLK_w){*r=2;*m=0x02;return 1;} if(k==SDLK_e){*r=2;*m=0x04;return 1;} if(k==SDLK_r){*r=2;*m=0x08;return 1;} if(k==SDLK_t){*r=2;*m=0x10;return 1;}
-    if(k==SDLK_1){*r=3;*m=0x01;return 1;} if(k==SDLK_2){*r=3;*m=0x02;return 1;} if(k==SDLK_3){*r=3;*m=0x04;return 1;} if(k==SDLK_4){*r=3;*m=0x08;return 1;} if(k==SDLK_5){*r=3;*m=0x10;return 1;}
-    if(k==SDLK_0){*r=4;*m=0x01;return 1;} if(k==SDLK_9){*r=4;*m=0x02;return 1;} if(k==SDLK_8){*r=4;*m=0x04;return 1;} if(k==SDLK_7){*r=4;*m=0x08;return 1;} if(k==SDLK_6){*r=4;*m=0x10;return 1;}
-    if(k==SDLK_p){*r=5;*m=0x01;return 1;} if(k==SDLK_o){*r=5;*m=0x02;return 1;} if(k==SDLK_i){*r=5;*m=0x04;return 1;} if(k==SDLK_u){*r=5;*m=0x08;return 1;} if(k==SDLK_y){*r=5;*m=0x10;return 1;}
-    if(k==SDLK_RETURN){*r=6;*m=0x01;return 1;} if(k==SDLK_l){*r=6;*m=0x02;return 1;} if(k==SDLK_k){*r=6;*m=0x04;return 1;} if(k==SDLK_j){*r=6;*m=0x08;return 1;} if(k==SDLK_h){*r=6;*m=0x10;return 1;}
-    if(k==SDLK_SPACE){*r=7;*m=0x01;return 1;} if(k==SDLK_LCTRL||k==SDLK_RCTRL){*r=7;*m=0x02;return 1;} if(k==SDLK_m){*r=7;*m=0x04;return 1;} if(k==SDLK_n){*r=7;*m=0x08;return 1;} if(k==SDLK_b){*r=7;*m=0x10;return 1;}
-    if(k==SDLK_BACKSPACE){*r=4;*m=0x01;return 1;} // Partial map for Backspace (Shift+0)
-    return 0;
-}
-
-// --- Audio Callback ---
-void audio_callback(void* userdata, Uint8* stream, int len) {
-    Sint16* buffer = (Sint16*)stream;
-    int num_samples = len / (int)sizeof(Sint16);
-    int channels = audio_channel_count > 0 ? audio_channel_count : 1;
-    if (channels <= 0) {
-        channels = 1;
-    }
-    int num_frames = (channels > 0) ? (num_samples / channels) : 0;
-    double cycles_per_sample = beeper_cycles_per_sample;
-    double playback_position = beeper_playback_position;
-    double last_input = beeper_hp_last_input;
-    double last_output = beeper_hp_last_output;
-    int level = beeper_playback_level;
-
-    if (cycles_per_sample <= 0.0 || num_frames <= 0) {
-        memset(buffer, 0, (size_t)len);
-        return;
-    }
-
-    if (beeper_event_head == beeper_event_tail && cycles_per_sample > 0.0) {
-        double idle_cycles = playback_position - (double)beeper_last_event_t_state;
-        if (idle_cycles > 0.0) {
-            double idle_samples = idle_cycles / cycles_per_sample;
-            if (idle_samples >= BEEPER_IDLE_RESET_SAMPLES) {
-                memset(buffer, 0, (size_t)len);
-
-                double new_position = playback_position + cycles_per_sample * (double)num_frames;
-                double writer_cursor = beeper_writer_cursor;
-                double writer_lag_samples = 0.0;
-                if (cycles_per_sample > 0.0) {
-                    writer_lag_samples = (new_position - writer_cursor) / cycles_per_sample;
-                }
-
-                if (!beeper_idle_log_active) {
-                    double idle_ms = (idle_cycles / CPU_CLOCK_HZ) * 1000.0;
-                    BEEPER_LOG(
-                        "[BEEPER] idle reset #%llu after %.0f samples (idle %.2f ms, playback %.0f -> %.0f cycles, writer %llu, cursor %.0f, lag %.2f samples)\n",
-                        (unsigned long long)(beeper_idle_reset_count + 1u),
-                        idle_samples,
-                        idle_ms,
-                        playback_position,
-                        new_position,
-                        (unsigned long long)beeper_last_event_t_state,
-                        writer_cursor,
-                        writer_lag_samples);
-                    if (beeper_logging_enabled) {
-                        beeper_idle_log_active = 1;
-                        ++beeper_idle_reset_count;
-                    }
-                }
-
-                double baseline = (double)level * (double)AUDIO_AMPLITUDE;
-                last_input = baseline;
-                last_output = 0.0;
-
-                audio_dump_write_samples(buffer, (size_t)(num_frames * channels));
-
-                beeper_playback_level = level;
-                beeper_playback_position = new_position;
-                if (beeper_writer_cursor < new_position) {
-                    beeper_writer_cursor = new_position;
-                }
-                if (new_position > (double)beeper_last_event_t_state) {
-                    uint64_t idle_sync_state = (uint64_t)llround(new_position);
-                    if (idle_sync_state < beeper_last_event_t_state) {
-                        idle_sync_state = beeper_last_event_t_state;
-                    }
-                    beeper_last_event_t_state = idle_sync_state;
-                }
-                beeper_hp_last_input = last_input;
-                beeper_hp_last_output = last_output;
-                (void)userdata;
-                return;
-            }
-        }
-    }
-
-    for (int frame = 0; frame < num_frames; ++frame) {
-        double target_position = playback_position + cycles_per_sample;
-
-        while (beeper_event_head != beeper_event_tail &&
-               (double)beeper_events[beeper_event_head].t_state <= target_position) {
-            level = beeper_events[beeper_event_head].level;
-            playback_position = (double)beeper_events[beeper_event_head].t_state;
-            beeper_event_head = (beeper_event_head + 1) % BEEPER_EVENT_CAPACITY;
-        }
-
-        double raw_sample = (double)level * (double)AUDIO_AMPLITUDE;
-        double filtered_sample = raw_sample - last_input + BEEPER_HP_ALPHA * last_output;
-        last_input = raw_sample;
-        last_output = filtered_sample;
-        double ay_left = 0.0;
-        double ay_right = 0.0;
-        ay_mix_sample(ay_cycles_per_sample, &ay_left, &ay_right);
-        double left_value = filtered_sample + ay_left;
-        double right_value = filtered_sample + ay_right;
-        double mono_value = filtered_sample + 0.5 * (ay_left + ay_right);
-
-        double output_left = (channels > 1) ? left_value : mono_value;
-        double output_right = (channels > 1) ? right_value : mono_value;
-
-        if (output_left > 32767.0) {
-            output_left = 32767.0;
-        } else if (output_left < -32768.0) {
-            output_left = -32768.0;
-        }
-
-        if (output_right > 32767.0) {
-            output_right = 32767.0;
-        } else if (output_right < -32768.0) {
-            output_right = -32768.0;
-        }
-
-        Sint16* frame_ptr = &buffer[frame * channels];
-        frame_ptr[0] = (Sint16)lrint(output_left);
-        if (channels > 1) {
-            frame_ptr[1] = (Sint16)lrint(output_right);
-        }
-        playback_position = target_position;
-    }
-
-    audio_dump_write_samples(buffer, (size_t)(num_frames * channels));
-
-    beeper_playback_level = level;
-    beeper_playback_position = playback_position;
-    if (beeper_writer_cursor < playback_position) {
-        beeper_writer_cursor = playback_position;
-    }
-    beeper_hp_last_input = last_input;
-    beeper_hp_last_output = last_output;
-
-    (void)userdata;
-}
-
-static void border_record_event(uint64_t event_t_state, uint8_t color_idx) {
-    color_idx &= 0x07u;
-
-    if (event_t_state < border_frame_start_tstate) {
-        border_frame_color = color_idx;
-        return;
-    }
-
-    if (border_color_event_count > 0) {
-        BorderColorEvent* last = &border_color_events[border_color_event_count - 1];
-        if (event_t_state < last->t_state) {
-            event_t_state = last->t_state;
-        }
-        if (last->color_idx == color_idx) {
-            return;
-        }
-    } else if (color_idx == border_frame_color) {
-        return;
-    }
-
-    size_t capacity = BORDER_EVENT_CAPACITY;
-    if (border_color_event_count >= capacity) {
-        size_t drop = border_color_event_count - capacity + 1u;
-        if (drop > border_color_event_count) {
-            drop = border_color_event_count;
-        }
-        if (drop > 0) {
-            size_t remaining = border_color_event_count - drop;
-            if (remaining > 0) {
-                memmove(&border_color_events[0], &border_color_events[drop], remaining * sizeof(BorderColorEvent));
-            }
-            border_color_event_count = remaining;
-        }
-    }
-
-    border_color_events[border_color_event_count].t_state = event_t_state;
-    border_color_events[border_color_event_count].color_idx = color_idx;
-    ++border_color_event_count;
-}
-
-static void border_draw_span(uint64_t span_start, uint64_t span_end, uint8_t color_idx) {
-    if (span_end <= span_start) {
-        return;
-    }
-
-    uint64_t frame_start = border_frame_start_tstate;
-    if (span_end <= frame_start) {
-        return;
-    }
-
-    uint64_t frame_end = frame_start + T_STATES_PER_FRAME;
-    if (span_start < frame_start) {
-        span_start = frame_start;
-    }
-    if (span_end > frame_end) {
-        span_end = frame_end;
-    }
-    if (span_end <= span_start) {
-        return;
-    }
-
-    uint32_t rgba = spectrum_colors[color_idx & 0x07u];
-
-    uint64_t offset_start = span_start - frame_start;
-    uint64_t offset_end = span_end - frame_start;
-
-    uint64_t line_start = offset_start / ULA_T_STATES_PER_LINE;
-    uint64_t line_end = (offset_end + (ULA_T_STATES_PER_LINE - 1u)) / ULA_T_STATES_PER_LINE;
-    if (line_end > ULA_LINES_PER_FRAME) {
-        line_end = ULA_LINES_PER_FRAME;
-    }
-
-    for (uint64_t line = line_start; line < line_end; ++line) {
-        if (line < ULA_VISIBLE_TOP_LINES) {
-            continue;
-        }
-        if (line >= ULA_LINES_PER_FRAME - ULA_VISIBLE_BOTTOM_LINES) {
-            continue;
-        }
-
-        int y = (int)(line - ULA_VISIBLE_TOP_LINES);
-        if (y < 0 || y >= TOTAL_HEIGHT) {
-            continue;
-        }
-
-        uint64_t line_tstate_start = line * ULA_T_STATES_PER_LINE;
-        uint64_t line_tstate_end = line_tstate_start + ULA_T_STATES_PER_LINE;
-
-        uint64_t segment_start = offset_start > line_tstate_start ? offset_start : line_tstate_start;
-        uint64_t segment_end = offset_end < line_tstate_end ? offset_end : line_tstate_end;
-        if (segment_end <= segment_start) {
-            continue;
-        }
-
-        uint64_t rel_start = segment_start - line_tstate_start;
-        uint64_t rel_end = segment_end - line_tstate_start;
-
-        if (rel_start >= ULA_LINE_VISIBLE_TSTATES) {
-            continue;
-        }
-        if (rel_end > ULA_LINE_VISIBLE_TSTATES) {
-            rel_end = ULA_LINE_VISIBLE_TSTATES;
-        }
-
-        int col_start = (int)(rel_start * 2u);
-        int col_end = (int)(rel_end * 2u);
-
-        if (col_start < 0) {
-            col_start = 0;
-        }
-        if (col_end > TOTAL_WIDTH) {
-            col_end = TOTAL_WIDTH;
-        }
-        if (col_start >= col_end) {
-            continue;
-        }
-
-        uint32_t* row = &pixels[y * TOTAL_WIDTH];
-        if (y < BORDER_SIZE || y >= BORDER_SIZE + SCREEN_HEIGHT) {
-            for (int x = col_start; x < col_end; ++x) {
-                row[x] = rgba;
-            }
-        } else {
-            int left_limit = BORDER_SIZE;
-            if (col_start < left_limit) {
-                int left_start = col_start;
-                int left_end = col_end < left_limit ? col_end : left_limit;
-                for (int x = left_start; x < left_end; ++x) {
-                    row[x] = rgba;
-                }
-            }
-
-            int right_limit = TOTAL_WIDTH - BORDER_SIZE;
-            if (col_end > right_limit) {
-                int right_start = col_start > right_limit ? col_start : right_limit;
-                if (right_start < col_end) {
-                    for (int x = right_start; x < col_end; ++x) {
-                        row[x] = rgba;
-                    }
-                }
-            }
-        }
-    }
-}
-
-// --- Main Program ---
-int main(int argc, char *argv[]) {
-    const char* rom_filename = NULL;
-    int rom_provided = 0;
-    int run_tests = 0;
-    const char* test_rom_dir = "tests/roms";
-    const char* snapshot_test_dir = "tests/snapshots";
-    int launch_fullscreen = 0;
-    Z80 cpu;
-    memset(&cpu, 0, sizeof(cpu));
-    paging_cpu_state = &cpu;
-
-    spectrum_init_log_output();
-
-    tape_set_input_path(NULL);
-
-    for (int i = 1; i < argc; ++i) {
-        if (strcmp(argv[i], "--audio-dump") == 0) {
-            if (i + 1 >= argc) {
-                print_usage(argv[0]);
-                return 1;
-            }
-            audio_dump_path = argv[++i];
-        } else if (strcmp(argv[i], "--model") == 0) {
-            if (i + 1 >= argc) {
-                print_usage(argv[0]);
-                return 1;
-            }
-            const char* model_value = argv[++i];
-            if (string_equals_case_insensitive(model_value, "48k")) {
-                spectrum_configure_model(SPECTRUM_MODEL_48K);
-            } else if (string_equals_case_insensitive(model_value, "128k")) {
-                spectrum_configure_model(SPECTRUM_MODEL_128K);
-            } else if (string_equals_case_insensitive(model_value, "plus2a") ||
-                       string_equals_case_insensitive(model_value, "+2a")) {
-                spectrum_configure_model(SPECTRUM_MODEL_PLUS2A);
-            } else if (string_equals_case_insensitive(model_value, "plus3") ||
-                       string_equals_case_insensitive(model_value, "+3")) {
-                spectrum_configure_model(SPECTRUM_MODEL_PLUS3);
-            } else {
-                fprintf(stderr, "Unknown model: %s\n", model_value);
-                return 1;
-            }
-        } else if (strcmp(argv[i], "--48k") == 0) {
-            spectrum_configure_model(SPECTRUM_MODEL_48K);
-        } else if (strcmp(argv[i], "--128k") == 0) {
-            spectrum_configure_model(SPECTRUM_MODEL_128K);
-        } else if (strcmp(argv[i], "--plus2a") == 0) {
-            spectrum_configure_model(SPECTRUM_MODEL_PLUS2A);
-        } else if (strcmp(argv[i], "--plus3") == 0) {
-            spectrum_configure_model(SPECTRUM_MODEL_PLUS3);
-        } else if (strcmp(argv[i], "--contention") == 0) {
-            if (i + 1 >= argc) {
-                print_usage(argv[0]);
-                return 1;
-            }
-            const char* profile_value = argv[++i];
-            if (string_equals_case_insensitive(profile_value, "48k")) {
-                spectrum_set_contention_profile(CONTENTION_PROFILE_48K);
-            } else if (string_equals_case_insensitive(profile_value, "128k")) {
-                spectrum_set_contention_profile(CONTENTION_PROFILE_128K);
-            } else if (string_equals_case_insensitive(profile_value, "plus2a") ||
-                       string_equals_case_insensitive(profile_value, "+2a")) {
-                spectrum_set_contention_profile(CONTENTION_PROFILE_128K_PLUS2A);
-            } else if (string_equals_case_insensitive(profile_value, "plus3") ||
-                       string_equals_case_insensitive(profile_value, "+3")) {
-                spectrum_set_contention_profile(CONTENTION_PROFILE_128K_PLUS3);
-            } else {
-                fprintf(stderr, "Unknown contention profile: %s\n", profile_value);
-                return 1;
-            }
-        } else if (strcmp(argv[i], "--peripheral") == 0) {
-            if (i + 1 >= argc) {
-                print_usage(argv[0]);
-                return 1;
-            }
-            const char* peripheral_value = argv[++i];
-            if (string_equals_case_insensitive(peripheral_value, "none")) {
-                spectrum_set_peripheral_contention_profile(PERIPHERAL_CONTENTION_NONE);
-            } else if (string_equals_case_insensitive(peripheral_value, "if1") ||
-                       string_equals_case_insensitive(peripheral_value, "interface1")) {
-                spectrum_set_peripheral_contention_profile(PERIPHERAL_CONTENTION_IF1);
-            } else if (string_equals_case_insensitive(peripheral_value, "plus3") ||
-                       string_equals_case_insensitive(peripheral_value, "+3")) {
-                spectrum_set_peripheral_contention_profile(PERIPHERAL_CONTENTION_PLUS3);
-            } else {
-                fprintf(stderr, "Unknown peripheral contention profile: %s\n", peripheral_value);
-                return 1;
-            }
-        } else if (strcmp(argv[i], "--ay-gain") == 0) {
-            if (i + 1 >= argc) {
-                print_usage(argv[0]);
-                return 1;
-            }
-            ay_global_gain = strtod(argv[++i], NULL);
-            if (ay_global_gain < 0.0) {
-                ay_global_gain = 0.0;
-            }
-        } else if (strcmp(argv[i], "--ay-pan") == 0) {
-            if (i + 1 >= argc) {
-                print_usage(argv[0]);
-                return 1;
-            }
-            if (!ay_parse_pan_spec(argv[++i])) {
-                fprintf(stderr, "Invalid AY pan specification. Use three comma-separated values within [-1,1].\n");
-                return 1;
-            }
-        } else if (strcmp(argv[i], "--beeper-log") == 0) {
-            beeper_logging_enabled = 1;
-        } else if (strcmp(argv[i], "--tape-debug") == 0) {
-            tape_debug_logging = 1;
-            tape_log("Tape debug logging enabled\n");
-        } else if (strcmp(argv[i], "--paging-log") == 0) {
-            paging_debug_logging = 1;
-            spectrum_log_paging_state("paging debug enabled", 0u, 0u, total_t_states);
-        } else if (strcmp(argv[i], "--paging-log-regs") == 0) {
-            paging_debug_logging = 1;
-            paging_log_registers = 1;
-            spectrum_log_paging_state("paging register logging enabled", 0u, 0u, total_t_states);
-        } else if (strcmp(argv[i], "--ram-hash-log") == 0) {
-            ram_hash_logging = 1;
-            spectrum_log_ram_hashes("startup");
-        } else if (strcmp(argv[i], "--tap") == 0) {
-            if (i + 1 >= argc) {
-                print_usage(argv[0]);
-                return 1;
-            }
-            if (tape_input_format != TAPE_FORMAT_NONE) {
-                fprintf(stderr, "Only one tape image may be specified\n");
-                return 1;
-            }
-            tape_input_format = TAPE_FORMAT_TAP;
-            tape_set_input_path(argv[++i]);
-        } else if (strcmp(argv[i], "--tzx") == 0) {
-            if (i + 1 >= argc) {
-                print_usage(argv[0]);
-                return 1;
-            }
-            if (tape_input_format != TAPE_FORMAT_NONE) {
-                fprintf(stderr, "Only one tape image may be specified\n");
-                return 1;
-            }
-            tape_input_format = TAPE_FORMAT_TZX;
-            tape_set_input_path(argv[++i]);
-        } else if (strcmp(argv[i], "--wav") == 0) {
-            if (i + 1 >= argc) {
-                print_usage(argv[0]);
-                return 1;
-            }
-            if (tape_input_format != TAPE_FORMAT_NONE) {
-                fprintf(stderr, "Only one tape image may be specified\n");
-                return 1;
-            }
-            tape_input_format = TAPE_FORMAT_WAV;
-            tape_set_input_path(argv[++i]);
-        } else if (strcmp(argv[i], "--snapshot") == 0) {
-            if (i + 1 >= argc) {
-                print_usage(argv[0]);
-                return 1;
-            }
-            if (snapshot_input_format != SNAPSHOT_FORMAT_NONE) {
-                fprintf(stderr, "Only one snapshot image may be specified\n");
-                return 1;
-            }
-            snapshot_input_path = argv[++i];
-            snapshot_input_format = snapshot_format_from_extension(snapshot_input_path);
-            if (snapshot_input_format == SNAPSHOT_FORMAT_NONE) {
-                fprintf(stderr, "Unsupported snapshot type for '%s'\n", snapshot_input_path);
-                return 1;
-            }
-        } else if (strcmp(argv[i], "--save-tap") == 0) {
-            if (i + 1 >= argc) {
-                print_usage(argv[0]);
-                return 1;
-            }
-            if (tape_recorder.enabled) {
-                fprintf(stderr, "Only one tape recording output may be specified\n");
-                return 1;
-            }
-            tape_recorder_enable(argv[++i], TAPE_OUTPUT_TAP);
-        } else if (strcmp(argv[i], "--save-wav") == 0) {
-            if (i + 1 >= argc) {
-                print_usage(argv[0]);
-                return 1;
-            }
-            if (tape_recorder.enabled) {
-                fprintf(stderr, "Only one tape recording output may be specified\n");
-                return 1;
-            }
-            tape_recorder_enable(argv[++i], TAPE_OUTPUT_WAV);
-        } else if (strcmp(argv[i], "--test-rom-dir") == 0) {
-            if (i + 1 >= argc) {
-                print_usage(argv[0]);
-                return 1;
-            }
-            test_rom_dir = argv[++i];
-        } else if (strcmp(argv[i], "--snapshot-test-dir") == 0) {
-            if (i + 1 >= argc) {
-                print_usage(argv[0]);
-                return 1;
-            }
-            snapshot_test_dir = argv[++i];
-        } else if (strcmp(argv[i], "--run-tests") == 0) {
-            run_tests = 1;
-        } else if (strcmp(argv[i], "--fullscreen") == 0) {
-            launch_fullscreen = 1;
-        } else {
-            SnapshotFormat inferred_snapshot = snapshot_format_from_extension(argv[i]);
-            TapeFormat inferred_format = tape_format_from_extension(argv[i]);
-            if (inferred_snapshot != SNAPSHOT_FORMAT_NONE && snapshot_input_format == SNAPSHOT_FORMAT_NONE) {
-                snapshot_input_format = inferred_snapshot;
-                snapshot_input_path = argv[i];
-            } else if (inferred_format != TAPE_FORMAT_NONE && tape_input_format == TAPE_FORMAT_NONE) {
-                tape_input_format = inferred_format;
-                tape_set_input_path(argv[i]);
-            } else if (!rom_filename) {
-                rom_filename = argv[i];
-                rom_provided = 1;
-            } else {
-                fprintf(stderr, "Unknown argument: %s\n", argv[i]);
-                print_usage(argv[0]);
-                return 1;
-            }
-        }
-    }
-
-    if (run_tests) {
-        return run_cpu_tests(test_rom_dir, snapshot_test_dir);
-    }
-
-    if (!rom_filename) {
-        rom_filename = default_rom_filename;
-    }
-
-    FILE* rf = fopen(rom_filename, "rb");
-    char *rom_fallback_path = NULL;
-    const char *rom_log_path = rom_filename;
-    if (!rf && !rom_provided) {
-        rom_fallback_path = build_executable_relative_path(argv[0], rom_filename);
-        if (rom_fallback_path) {
-            rf = fopen(rom_fallback_path, "rb");
-            if (rf) {
-                rom_log_path = rom_fallback_path;
-            }
-        }
-    }
-    if (!rf) {
-        perror("ROM open error");
-        fprintf(stderr, "File: %s\n", rom_log_path);
-        free(rom_fallback_path);
-        return 1;
-    }
-    uint8_t rom_buffer[0x10000];
-    size_t rom_read = fread(rom_buffer, 1, sizeof(rom_buffer), rf);
-    fclose(rf);
-    if (rom_read < 0x4000) {
-        fprintf(stderr, "ROM read error (%zu bytes)\n", rom_read);
-        free(rom_fallback_path);
-        return 1;
-    }
-
-    memset(memory, 0, sizeof(memory));
-    memset(ram_pages, 0, sizeof(ram_pages));
-
-    if (!spectrum_populate_rom_pages(rom_log_path, rom_buffer, rom_read)) {
-        free(rom_fallback_path);
-        return 1;
-    }
-
-    spectrum_configure_model(spectrum_model);
-    spectrum_map_rom_page(0u);
-
-    if (snapshot_input_format != SNAPSHOT_FORMAT_NONE && snapshot_input_path) {
-        if (!snapshot_load(snapshot_input_path, snapshot_input_format, &cpu)) {
-            free(rom_fallback_path);
-            return 1;
-        }
-        printf("Loaded snapshot %s\n", snapshot_input_path);
-    }
-
-    printf("Loaded %zu bytes from %s (%u ROM banks)\n",
-           rom_read,
-           rom_log_path,
-           (unsigned int)rom_page_count);
-    free(rom_fallback_path);
-
-    tape_playback.use_waveform_playback = 0;
-    if (tape_input_format != TAPE_FORMAT_NONE && tape_input_path) {
-        if (tape_input_format == TAPE_FORMAT_WAV) {
-            if (!tape_load_wav(tape_input_path, &tape_playback)) {
-                tape_waveform_reset(&tape_playback.waveform);
-                return 1;
-            }
-            printf("Loaded WAV tape %s (%zu transitions @ %u Hz)\n",
-                   tape_input_path,
-                   tape_playback.waveform.count,
-                   (unsigned)tape_playback.waveform.sample_rate);
-            if (tape_playback.waveform.count == 0) {
-                fprintf(stderr, "Warning: WAV tape '%s' contains no transitions\n", tape_input_path);
-            }
-            tape_input_enabled = 1;
-        } else {
-            tape_playback.format = tape_input_format;
-            tape_waveform_reset(&tape_playback.waveform);
-            if (!tape_load_image(tape_input_path, tape_input_format, &tape_playback.image)) {
-                tape_free_image(&tape_playback.image);
-                return 1;
-            }
-            if (!tape_generate_waveform_from_image(&tape_playback.image, &tape_playback.waveform)) {
-                fprintf(stderr, "Failed to synthesise tape playback waveform for '%s'\n", tape_input_path);
-                tape_free_image(&tape_playback.image);
-                tape_waveform_reset(&tape_playback.waveform);
-                return 1;
-            }
-            tape_playback.use_waveform_playback = 1;
-            printf("Loaded tape image %s (%zu blocks)\n", tape_input_path, tape_playback.image.count);
-            if (tape_playback.image.count == 0) {
-                fprintf(stderr, "Warning: tape image '%s' is empty\n", tape_input_path);
-                tape_input_enabled = 0;
-            } else {
-                tape_input_enabled = 1;
-            }
-        }
-    } else {
-        tape_input_enabled = 0;
-    }
-
-    speaker_output_level = speaker_calculate_output_level();
-
-    if(!init_sdl()){tape_shutdown();cleanup_sdl();return 1;}
-
-    if (launch_fullscreen && !window_fullscreen) {
-        toggle_fullscreen();
-    }
-
-    if (snapshot_input_format == SNAPSHOT_FORMAT_NONE) {
-        cpu.reg_PC = 0x0000;
-        cpu.reg_SP = 0xFFFF;
-        cpu.iff1 = 0;
-        cpu.iff2 = 0;
-        cpu.interruptMode = 1;
-    }
-    cpu.halted = 0;
-    cpu.ei_delay = 0;
-    total_t_states = 0;
-
-    if (tape_input_enabled) {
-        tape_reset_playback(&tape_playback);
-        tape_deck_status = TAPE_DECK_STATUS_STOP;
-    } else if (tape_recorder.enabled) {
-        tape_deck_status = TAPE_DECK_STATUS_STOP;
-    } else {
-        tape_deck_status = TAPE_DECK_STATUS_IDLE;
-    }
-
-    if (tape_input_enabled || tape_recorder.enabled) {
-        printf("Tape controls: F5 Play, F6 Stop, F7 Rewind");
-        if (tape_recorder.enabled) {
-            printf(", F8 Record");
-        }
-        printf("\n");
-    }
-
-    printf("Tape manager: Press Tab to open popup controls\n");
-
-    if (audio_available) {
-        SDL_LockAudio();
-        beeper_reset_audio_state(total_t_states, speaker_output_level);
-        SDL_UnlockAudio();
-    } else {
-        beeper_reset_audio_state(total_t_states, speaker_output_level);
-    }
-
-    printf("Starting Z80 emulation...\n");
-
-    int quit = 0;
-    SDL_Event e;
-    uint64_t performance_frequency = SDL_GetPerformanceFrequency();
-    uint64_t previous_counter = SDL_GetPerformanceCounter();
-    double cycle_accumulator = 0.0;
-    int frame_t_state_accumulator = 0;
-
-    while (!quit) {
-        while (SDL_PollEvent(&e) != 0) {
-            if (e.type == SDL_QUIT) {
-                quit = 1;
-            } else if (e.type == SDL_MOUSEBUTTONDOWN) {
-                if (tape_handle_mouse_button(&e)) {
-                    continue;
-                }
-            } else if (e.type == SDL_TEXTINPUT) {
-                if (tape_manager_handle_text_input(&e)) {
-                    continue;
-                }
-            } else if (e.type == SDL_KEYDOWN || e.type == SDL_KEYUP) {
-                if (e.type == SDL_KEYDOWN && !e.key.repeat) {
-                    SDL_Keycode sym = e.key.keysym.sym;
-                    SDL_Keymod mods = e.key.keysym.mod;
-                    if (sym == SDLK_ESCAPE) {
-                        quit = 1;
-                        continue;
-                    }
-                    if (sym == SDLK_F11 || (sym == SDLK_RETURN && (mods & KMOD_ALT))) {
-                        toggle_fullscreen();
-                        continue;
-                    }
-                }
-                if (tape_handle_control_key(&e)) {
-                    continue;
-                }
-                if (tape_manager_handle_event(&e)) {
-                    continue;
-                }
-                int row = -1;
-                uint8_t mask = 0;
-                int mapped = map_sdl_key_to_spectrum(e.key.keysym.sym, &row, &mask);
-                if (mapped) {
-                    if (e.type == SDL_KEYDOWN) {
-                        keyboard_matrix[row] &= ~mask;
-                        if (e.key.keysym.sym == SDLK_BACKSPACE) {
-                            keyboard_matrix[0] &= ~0x01; // Press Shift
-                        }
-                    } else {
-                        keyboard_matrix[row] |= mask;
-                        if (e.key.keysym.sym == SDLK_BACKSPACE) {
-                            keyboard_matrix[0] |= 0x01; // Release Shift
-                        }
-                    }
-                }
-            }
-        }
-
-        if (quit) {
-            break;
-        }
-
-        uint64_t current_counter = SDL_GetPerformanceCounter();
-        double elapsed_seconds = (double)(current_counter - previous_counter) / (double)performance_frequency;
-        previous_counter = current_counter;
-
-        if (elapsed_seconds < 0.0) {
-            elapsed_seconds = 0.0;
-        }
-
-        cycle_accumulator += elapsed_seconds * CPU_CLOCK_HZ;
-        if (cycle_accumulator > CPU_CLOCK_HZ * 0.25) {
-            cycle_accumulator = CPU_CLOCK_HZ * 0.25;
-        }
-
-        if (audio_available && beeper_cycles_per_sample > 0.0) {
-            double latency_samples = beeper_current_latency_samples();
-            double threshold = beeper_latency_threshold();
-            if (latency_samples >= threshold) {
-                Uint32 delay_ms = beeper_recommended_throttle_delay(latency_samples);
-                SDL_Delay(delay_ms);
-                continue;
-            }
-        }
-
-        if (cycle_accumulator < 1.0) {
-            SDL_Delay(0);
-            continue;
-        }
-
-        int cycles_to_execute = (int)cycle_accumulator;
-        int latency_poll_cycles = 0;
-        int latency_poll_threshold = 0;
-        int throttled_audio = 0;
-        double throttled_latency_samples = 0.0;
-
-        if (audio_available && beeper_cycles_per_sample > 0.0) {
-            latency_poll_threshold = (int)(beeper_cycles_per_sample * 32.0);
-            if (latency_poll_threshold < 128) {
-                latency_poll_threshold = 128;
-            }
-        }
-
-        while (cycles_to_execute > 0) {
-            if (cpu.ei_delay) {
-                cpu.iff1 = cpu.iff2 = 1;
-                cpu.ei_delay = 0;
-            }
-
-            int t_states = cpu.halted ? 4 : cpu_step(&cpu);
-            if (t_states <= 0) {
-                t_states = 4;
-            }
-
-            cycles_to_execute -= t_states;
-            cycle_accumulator -= t_states;
-            if (cycle_accumulator < 0.0) {
-                cycle_accumulator = 0.0;
-            }
-
-            frame_t_state_accumulator += t_states;
-            total_t_states += t_states;
-
-            ula_process_port_events(total_t_states);
-            tape_update(total_t_states);
-            tape_recorder_update(total_t_states, 0);
-
-            if (audio_available && latency_poll_threshold > 0) {
-                latency_poll_cycles += t_states;
-                if (latency_poll_cycles >= latency_poll_threshold) {
-                    latency_poll_cycles = 0;
-                    double latency_samples = beeper_current_latency_samples();
-                    if (latency_samples >= beeper_latency_threshold()) {
-                        throttled_audio = 1;
-                        throttled_latency_samples = latency_samples;
-                        break;
-                    }
-                }
-            }
-
-            while (frame_t_state_accumulator >= T_STATES_PER_FRAME) {
-                if (cpu.iff1) {
-                    int interrupt_t_states = cpu_interrupt(&cpu, 0xFF);
-                    total_t_states += interrupt_t_states;
-                    frame_t_state_accumulator += interrupt_t_states;
-                }
-                render_screen();
-                frame_t_state_accumulator -= T_STATES_PER_FRAME;
-            }
-        }
-
-        if (throttled_audio) {
-            Uint32 delay_ms = beeper_recommended_throttle_delay(throttled_latency_samples);
-            SDL_Delay(delay_ms);
-            continue;
-        }
-    }
-
-    spectrum_log_ram_hashes("exit");
-    printf("Emulation finished.\nFinal State:\nPC:%04X SP:%04X AF:%04X BC:%04X DE:%04X HL:%04X IX:%04X IY:%04X\n",cpu.reg_PC,cpu.reg_SP,get_AF(&cpu),get_BC(&cpu),get_DE(&cpu),get_HL(&cpu),cpu.reg_IX,cpu.reg_IY);
-    tape_shutdown();
-    cleanup_sdl(); return 0;
-}
 static void ula_queue_port_value(uint8_t value) {
     uint64_t event_t_state = total_t_states;
     if (ula_instruction_progress_ptr) {
