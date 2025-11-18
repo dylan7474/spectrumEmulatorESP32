@@ -6,6 +6,7 @@ This repository is being prepared for a dedicated ESP32 build targeting the Free
 - **Platform**: Centered on ESP32 bring-up for the FNK0103 board.
 - **Input/Audio**: Pending reimplementation via ESP32 GPIO/touch and I2S peripherals.
 - **Video**: LCD path implemented with an Arduino GFX-powered blit routine that converts the emulator’s RGBA buffer to the panel’s RGB565 backbuffer (double-buffered when PSRAM is available).
+- **Desktop fallback**: The legacy SDL renderer/audio backend has been removed so the source tree now exclusively targets the ESP32 toolchain.
 - **Goal**: Standalone ESP32 firmware with LCD, I2S audio, on-board input, and storage support.
 
 ## ESP32 bring-up prerequisites
