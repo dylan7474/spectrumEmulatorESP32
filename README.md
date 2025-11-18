@@ -13,7 +13,9 @@ This repository is being prepared for a dedicated ESP32 build targeting the Free
 - `git` and `python3` for working with the codebase and helper scripts.
 - `arduino-cli` with the Espressif ESP32 core and the TFT_eSPI library (see bootstrap below).
 
-Run `./configure` (or `make check-env`) to validate that the Arduino toolchain pieces are present.
+Run `./configure` (or `make check-env`) to validate that the Arduino toolchain pieces are present. The `environment` bootstrap
+script in the repository root automates the same apt/`arduino-cli` steps that CI uses, including proxy propagation and retry
+logic for core/library downloads.
 
 ### Environment bootstrap for Arduino/ESP32 tooling
 The following steps mirror the CI/bootstrap script used for ESP32 bring-up. Run them on Debian/Ubuntu systems to prepare `arduino-cli` with the ESP32 core and TFT driver library:
@@ -48,6 +50,27 @@ arduino-cli lib install "TFT_eSPI"
 ```
 
 After the toolchain is installed, run `make arduino-prepare` to refresh indexes and libraries, or `make arduino-build` with the appropriate `ARDUINO_FQBN` when the ESP32 firmware scaffold is in place.
+
+## Code review highlights
+- `init_lcd_backend()` in `z80.c` allocates PSRAM-backed framebuffers and immediately requires a board-supplied `create_board_gfx()` implementation. The current weak stub simply returns `NULL`, so the firmware will log "LCD driver unavailable" until the board layer constructs and returns the correct `Arduino_GFX` instance for the FNK0103 display bus.
+- The LCD bring-up path sets `audio_available = 0` and never programs an I2S sink, so audio is effectively muted on ESP32 builds. The AY/buzzer mixer is still present in the core, but a hardware transport needs to be implemented before deployment.
+- `keyboard_matrix` remains initialized to a fixed "all keys released" state, and there is no GPIO/touch scanning logic tied into the emulator loop. Without wiring real inputs into `keyboard_matrix`, the firmware will boot into the Spectrum BASIC prompt without any way for users to interact.
+- Host-style file I/O (e.g., `fopen`, directory walking, WAV/tape read/write routines) is still baked into `z80.c`. Porting these helpers to ESP-IDF storage APIs (flash partitions or SD) is required before `.tap`, `.tzx`, `.z80`, and `.sna` handling will work on-device.
+- The repository currently lacks an ESP-IDF project skeleton. `Makefile` targets still focus on Arduino CLI setup, but there is no `idf.py` workflow, partition map, or sdkconfig defaults for the FNK0103 board.
+
+## Next steps to complete ESP32 deployment
+1. **Board-specific LCD wiring**
+   - Implement `create_board_gfx()` (ideally under a new `boards/fnk0103/` component) so that `init_lcd_backend()` receives a fully configured `Arduino_GFX` transport for the RGB panel or SPI bridge that ships with the Freenove kit. Confirm that PSRAM-backed double buffering succeeds on-device and fall back to a single buffer otherwise.
+2. **Audio transport**
+   - Add an I2S driver (DAC or external codec) and hook the existing AY/buzzer mixer output into a ring buffer so that `audio_available` can be re-enabled on ESP32 builds.
+3. **Input scanning**
+   - Poll the physical buttons or touch pads, translate them into Spectrum keyboard rows/columns, and populate `keyboard_matrix` each frame so BASIC, tape menus, and in-game controls respond.
+4. **Storage adapters**
+   - Wrap `fopen`/`fread`/`fwrite`/`stat` usage with ESP-IDF-compatible file APIs, define where ROMs and user media live on the device, and document the resulting directory layout.
+5. **ESP-IDF project scaffolding**
+   - Introduce an ESP-IDF project (CMakeLists, `sdkconfig.defaults`, partition table, flashing instructions) so that contributors can `idf.py build/flash/monitor` the firmware instead of relying on the placeholder Arduino CLI target.
+6. **Runtime UX polish**
+   - Revisit the tape manager overlays and Tab-invoked controls once the LCD/input pipeline exists to ensure the embedded UI is still readable and operable on the 4.0" panel.
 
 ## LCD video backend
  - The emulator now drives the FNK0103 LCD panel through Arduino GFX. Implement `create_board_gfx()` in your board layer to return an initialized `Arduino_GFX*` for the panel bus you are using (RGB panel helper or SPI/QSPI bridge).

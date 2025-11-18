@@ -13,3 +13,5 @@
 - Keep the README roadmap entries (especially the snapshot stress-test section) current so contributors know which compatibility probes and paging scenarios still need coverage.
 - Keep the ESP32 port roadmap in `README.md` and the detailed checklist in `ESP32_PORT.md` synchronized with the codebase and board support status.
 - Update ESP32-specific build, storage, and peripheral notes in `ESP32_PORT.md` whenever the board bring-up steps change.
+- Keep the `README.md` "Code review highlights" and "Next steps to complete ESP32 deployment" sections aligned with the actual blockers and ensure they do not drift from the `ESP32_PORT.md` checklist.
+- Whenever the `environment` bootstrap script changes, refresh the README instructions that describe the script so developers know how to run the updated flow.
