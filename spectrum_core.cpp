@@ -28,8 +28,25 @@
 
 #if defined(ESP_PLATFORM)
 #include <Arduino.h>
+#if defined(__has_include)
+#if __has_include(<Arduino_GFX_Library.h>)
+#define SPECTRUM_HAS_ARDUINO_GFX 1
+#endif
+#endif
+#if defined(SPECTRUM_HAS_ARDUINO_GFX)
 #include <Arduino_GFX_Library.h>
+#endif
 #include <esp_heap_caps.h>
+#endif
+
+#if defined(ESP_PLATFORM) && !defined(SPECTRUM_HAS_ARDUINO_GFX)
+typedef struct Arduino_GFX Arduino_GFX;
+#endif
+
+#include "spectrum_core.h"
+
+#if !defined(Sint16)
+typedef int16_t Sint16;
 #endif
 
 #ifndef M_PI
@@ -39,6 +56,21 @@
 #ifndef PATH_MAX
 #define PATH_MAX 4096
 #endif
+
+typedef struct SpectrumMemoryPage SpectrumMemoryPage;
+typedef struct AyState AyState;
+typedef struct TapeBlock TapeBlock;
+typedef struct TapeImage TapeImage;
+typedef struct TapePulse TapePulse;
+typedef struct TapeWaveform TapeWaveform;
+typedef struct TapePlaybackState TapePlaybackState;
+typedef struct TapeRecorder TapeRecorder;
+typedef struct TapeControlRect TapeControlRect;
+typedef struct TapeControlButton TapeControlButton;
+typedef struct TapeControlIcon TapeControlIcon;
+typedef struct TapeOverlayGlyph TapeOverlayGlyph;
+typedef struct TapeBrowserEntry TapeBrowserEntry;
+typedef struct Z80 Z80;
 
 // --- Z80 Flag Register Bits ---
 #define FLAG_C  (1 << 0) // Carry Flag
@@ -51,7 +83,7 @@
 // --- Global Memory ---
 uint8_t memory[0x10000]; // 65536 bytes
 
-typedef enum {
+typedef enum SpectrumModel {
     SPECTRUM_MODEL_48K,
     SPECTRUM_MODEL_128K,
     SPECTRUM_MODEL_PLUS2A,
@@ -74,14 +106,14 @@ static const char* spectrum_model_to_string(SpectrumModel model) {
     return "Unknown";
 }
 
-typedef enum {
+typedef enum SpectrumContentionProfile {
     CONTENTION_PROFILE_48K,
     CONTENTION_PROFILE_128K,
     CONTENTION_PROFILE_128K_PLUS2A,
     CONTENTION_PROFILE_128K_PLUS3
 } SpectrumContentionProfile;
 
-typedef enum {
+typedef enum PeripheralContentionProfile {
     PERIPHERAL_CONTENTION_NONE,
     PERIPHERAL_CONTENTION_IF1,
     PERIPHERAL_CONTENTION_PLUS3
@@ -105,16 +137,16 @@ static uint8_t ay_registers[16];
 static uint8_t ay_selected_register = 0u;
 static int ay_register_latched = 0;
 
-typedef enum {
+typedef enum SpectrumMemoryPageType {
     MEMORY_PAGE_NONE,
     MEMORY_PAGE_ROM,
     MEMORY_PAGE_RAM
 } SpectrumMemoryPageType;
 
-typedef struct {
+struct SpectrumMemoryPage {
     SpectrumMemoryPageType type;
     uint8_t index;
-} SpectrumMemoryPage;
+};
 
 static SpectrumMemoryPage spectrum_pages[4] = {
     {MEMORY_PAGE_ROM, 0u},
@@ -122,6 +154,41 @@ static SpectrumMemoryPage spectrum_pages[4] = {
     {MEMORY_PAGE_RAM, 2u},
     {MEMORY_PAGE_RAM, 0u}
 };
+
+// --- Function Prototypes ---
+uint8_t readByte(uint16_t addr);
+void writeByte(uint16_t addr, uint8_t val);
+uint16_t readWord(uint16_t addr);
+void writeWord(uint16_t addr, uint16_t val);
+uint8_t io_read(uint16_t port);
+void io_write(uint16_t port, uint8_t value);
+int cpu_step(Z80* cpu);
+int init_lcd_backend(void);
+void cleanup_lcd_backend(void);
+void render_screen(void);
+int cpu_interrupt(Z80* cpu, uint8_t data_bus);
+int cpu_nmi(Z80* cpu);
+int cpu_ddfd_cb_step(Z80* cpu, uint16_t* index_reg, int is_ix);
+void audio_callback(void* userdata, uint8_t* stream, int len);
+static void border_record_event(uint64_t event_t_state, uint8_t color_idx);
+static void border_draw_span(uint64_t span_start, uint64_t span_end, uint8_t color_idx);
+static void spectrum_map_page(int segment, SpectrumMemoryPageType type, uint8_t index);
+static void spectrum_refresh_visible_ram(void);
+static void spectrum_apply_memory_configuration(void);
+static void spectrum_update_contention_flags(void);
+static void video_free_framebuffers(void);
+static inline int ula_contention_penalty(uint64_t t_state);
+static void beeper_reset_audio_state(uint64_t current_t_state, int current_level);
+static void beeper_set_latency_limit(double sample_limit);
+static void beeper_push_event(uint64_t t_state, int level);
+static size_t beeper_catch_up_to(double catch_up_position, double playback_position_snapshot);
+static double beeper_current_latency_samples(void);
+static double beeper_latency_threshold(void);
+static uint32_t beeper_recommended_throttle_delay(double latency_samples);
+static int audio_dump_start(const char* path, uint32_t sample_rate, uint16_t channels);
+static void audio_dump_write_samples(const Sint16* samples, size_t count);
+static void audio_dump_finish(void);
+static void audio_dump_abort(void);
 
 // --- ZX Spectrum Constants ---
 #define SCREEN_WIDTH 256
@@ -159,6 +226,24 @@ static uint16_t spectrum_bright_colors_565[8];
 
 uint32_t pixels[ TOTAL_WIDTH * TOTAL_HEIGHT ];
 
+typedef struct BorderColorEvent {
+    uint64_t t_state;
+    uint8_t color_idx;
+} BorderColorEvent;
+
+static BorderColorEvent border_color_events[BORDER_EVENT_CAPACITY];
+static size_t border_color_event_count = 0;
+static uint64_t border_frame_start_tstate = 0;
+static uint8_t border_frame_color = 0;
+uint8_t border_color_idx = 0;
+
+// --- Timing Globals ---
+uint64_t total_t_states = 0; // A global clock for the entire CPU
+
+// --- ZX Spectrum Colours ---
+const uint32_t spectrum_colors[8] = {0x000000FF,0x0000CDFF,0xCD0000FF,0xCD00CDFF,0x00CD00FF,0x00CDCDFF,0xCDCD00FF,0xCFCFCFFF};
+const uint32_t spectrum_bright_colors[8] = {0x000000FF,0x0000FFFF,0xFF0000FF,0xFF00FFFF,0x00FF00FF,0x00FFFFFF,0xFFFF00FF,0xFFFFFFF};
+
 // --- Audio Globals ---
 volatile int beeper_state = 0; // 0 = low, 1 = high
 const int AUDIO_AMPLITUDE = 2000;
@@ -173,6 +258,14 @@ static double beeper_latency_throttle_samples = 320.0;
 static double beeper_latency_release_samples = 256.0;
 static double beeper_latency_trim_samples = 512.0;
 static const double BEEPER_HP_ALPHA = 0.995;
+static int beeper_logging_enabled = 0;
+
+#define BEEPER_LOG(...)                                                     \
+    do {                                                                    \
+        if (beeper_logging_enabled) {                                       \
+            fprintf(stderr, __VA_ARGS__);                                   \
+        }                                                                   \
+    } while (0)
 
 static const char* audio_dump_path = NULL;
 
@@ -196,7 +289,7 @@ static const double ay_volume_table[16] = {
 static void audio_backend_lock(void) {}
 static void audio_backend_unlock(void) {}
 
-typedef struct {
+struct AyState {
     double tone_period[3];
     double tone_counter[3];
     int tone_output[3];
@@ -212,7 +305,7 @@ typedef struct {
     int envelope_alternate;
     int envelope_continue;
     int envelope_active;
-} AyState;
+};
 
 static AyState ay_state;
 static double ay_hp_last_input_left = 0.0;
@@ -231,7 +324,7 @@ static const int TAPE_DATA_PILOT_COUNT = 3223;
 static const uint64_t TAPE_SILENCE_THRESHOLD_TSTATES = 350000ULL; // 0.1 second
 static const uint64_t TAPE_RECORDER_AUTOSTOP_TSTATES = 7000000ULL; // ~2 seconds
 
-typedef enum {
+typedef enum TapeBlockType {
     TAPE_BLOCK_TYPE_STANDARD,
     TAPE_BLOCK_TYPE_TURBO,
     TAPE_BLOCK_TYPE_PURE_DATA,
@@ -240,7 +333,7 @@ typedef enum {
     TAPE_BLOCK_TYPE_DIRECT_RECORDING
 } TapeBlockType;
 
-typedef struct {
+struct TapeBlock {
     TapeBlockType type;
     uint8_t* data;
     uint32_t length;
@@ -262,34 +355,34 @@ typedef struct {
     uint8_t* direct_samples;
     uint32_t direct_sample_count;
     int direct_initial_level;
-} TapeBlock;
+};
 
-typedef struct {
+struct TapeImage {
     TapeBlock* blocks;
     size_t count;
     size_t capacity;
-} TapeImage;
+};
 
-typedef struct {
+struct TapePulse {
     uint32_t duration;
-} TapePulse;
+};
 
-typedef struct {
+struct TapeWaveform {
     TapePulse* pulses;
     size_t count;
     size_t capacity;
     int initial_level;
     uint32_t sample_rate;
-} TapeWaveform;
+};
 
-typedef enum {
+typedef enum TapeFormat {
     TAPE_FORMAT_NONE,
     TAPE_FORMAT_TAP,
     TAPE_FORMAT_TZX,
     TAPE_FORMAT_WAV
 } TapeFormat;
 
-typedef enum {
+typedef enum SnapshotFormat {
     SNAPSHOT_FORMAT_NONE,
     SNAPSHOT_FORMAT_SNA,
     SNAPSHOT_FORMAT_Z80
@@ -297,7 +390,7 @@ typedef enum {
 
 typedef struct Z80 Z80;
 
-typedef enum {
+typedef enum TapePhase {
     TAPE_PHASE_IDLE,
     TAPE_PHASE_PILOT,
     TAPE_PHASE_SYNC1,
@@ -307,7 +400,7 @@ typedef enum {
     TAPE_PHASE_DONE
 } TapePhase;
 
-typedef struct {
+struct TapePlaybackState {
     TapeImage image;
     TapeWaveform waveform;
     TapeFormat format;
@@ -328,15 +421,15 @@ typedef struct {
     uint64_t position_tstates;
     uint64_t position_start_tstate;
     uint64_t last_transition_tstate;
-} TapePlaybackState;
+};
 
-typedef enum {
+typedef enum TapeOutputFormat {
     TAPE_OUTPUT_NONE,
     TAPE_OUTPUT_TAP,
     TAPE_OUTPUT_WAV
 } TapeOutputFormat;
 
-typedef struct {
+struct TapeRecorder {
     TapeImage recorded;
     TapePulse* pulses;
     size_t pulse_count;
@@ -365,7 +458,7 @@ typedef struct {
     uint64_t wav_head_samples;
     int wav_requires_truncate;
     uint64_t idle_start_tstate;
-} TapeRecorder;
+};
 
 static TapePlaybackState tape_playback = {0};
 static TapeRecorder tape_recorder = {0};
@@ -374,7 +467,7 @@ static int tape_input_enabled = 0;
 
 static FILE* spectrum_log_file = NULL;
 
-typedef enum {
+typedef enum TapeDeckStatus {
     TAPE_DECK_STATUS_IDLE,
     TAPE_DECK_STATUS_PLAY,
     TAPE_DECK_STATUS_STOP,
@@ -414,7 +507,7 @@ static void spectrum_log_cpu_state(uint64_t tstate);
 static void spectrum_log_ram_hashes(const char* reason);
 static uint32_t spectrum_hash_buffer(const uint8_t* data, size_t length);
 
-typedef enum {
+typedef enum TapeManagerMode {
     TAPE_MANAGER_MODE_HIDDEN,
     TAPE_MANAGER_MODE_MENU,
     TAPE_MANAGER_MODE_FILE_INPUT,
@@ -429,11 +522,11 @@ static size_t tape_manager_input_length = 0u;
 #define TAPE_MANAGER_BROWSER_MAX_ENTRIES 256
 #define TAPE_MANAGER_BROWSER_VISIBLE_LINES 10
 
-typedef struct {
+struct TapeBrowserEntry {
     char name[PATH_MAX];
     int is_dir;
     int is_up;
-} TapeBrowserEntry;
+};
 
 static char tape_manager_browser_path[PATH_MAX];
 static TapeBrowserEntry tape_manager_browser_entries[TAPE_MANAGER_BROWSER_MAX_ENTRIES];
@@ -521,7 +614,7 @@ static void spectrum_log_paging_state(const char* reason,
     spectrum_log_cpu_state(tstate);
 }
 
-typedef enum {
+typedef enum TapeControlAction {
     TAPE_CONTROL_ACTION_NONE = 0,
     TAPE_CONTROL_ACTION_PLAY,
     TAPE_CONTROL_ACTION_STOP,
@@ -533,24 +626,24 @@ typedef enum {
 #define TAPE_CONTROL_ICON_WIDTH 7
 #define TAPE_CONTROL_ICON_HEIGHT 7
 
-typedef struct {
+struct TapeControlRect {
     int x;
     int y;
     int w;
     int h;
-} TapeControlRect;
+};
 
-typedef struct {
+struct TapeControlButton {
     TapeControlAction action;
     TapeControlRect rect;
     int enabled;
     int visible;
-} TapeControlButton;
+};
 
-typedef struct {
+struct TapeControlIcon {
     TapeControlAction action;
     uint8_t rows[TAPE_CONTROL_ICON_HEIGHT];
-} TapeControlIcon;
+};
 
 static TapeControlButton tape_control_buttons[TAPE_CONTROL_BUTTON_MAX];
 static int tape_control_button_count = 0;
@@ -558,10 +651,10 @@ static int tape_control_button_count = 0;
 #define TAPE_OVERLAY_FONT_WIDTH 5
 #define TAPE_OVERLAY_FONT_HEIGHT 7
 
-typedef struct {
+struct TapeOverlayGlyph {
     char ch;
     uint8_t rows[TAPE_OVERLAY_FONT_HEIGHT];
-} TapeOverlayGlyph;
+};
 
 static const TapeOverlayGlyph tape_overlay_font[] = {
     {' ', {0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00}},
@@ -631,7 +724,7 @@ static const TapeControlIcon tape_control_icons[] = {
     }
 };
 
-typedef struct {
+typedef struct UlaWriteEvent {
     uint8_t value;
     uint64_t t_state;
 } UlaWriteEvent;
@@ -736,6 +829,10 @@ static int ay_parse_pan_spec(const char* spec);
 // panel wiring once the new LCD layer is finalized.
 int init_lcd_backend(void) {
 #if defined(ESP_PLATFORM)
+#if !defined(SPECTRUM_HAS_ARDUINO_GFX)
+    fprintf(stderr, "LCD backend unavailable: install the Arduino_GFX library for ESP32 builds.");
+    return 0;
+#else
     video_free_framebuffers();
     lcd_framebuffer_size = (size_t)TOTAL_WIDTH * (size_t)TOTAL_HEIGHT * sizeof(uint16_t);
 
@@ -771,6 +868,7 @@ int init_lcd_backend(void) {
     lcd->fillScreen(0x0000);
     audio_available = 0;
     return 1;
+#endif
 #else
     fprintf(stderr, "LCD backend requested but ESP_PLATFORM is not defined.
 ");
@@ -885,7 +983,7 @@ void render_screen(void) {
     }
     tape_render_overlay();
     tape_render_manager();
-#if defined(ESP_PLATFORM)
+#if defined(ESP_PLATFORM) && defined(SPECTRUM_HAS_ARDUINO_GFX)
     if (lcd_framebuffers[lcd_backbuffer_index]) {
         video_convert_framebuffer(lcd_framebuffers[lcd_backbuffer_index]);
         if (lcd) {
@@ -898,6 +996,33 @@ void render_screen(void) {
 #endif
 }
 
+static void ula_queue_port_value(uint8_t value);
+static void ula_process_port_events(uint64_t current_t_state);
+
+static FILE* audio_dump_file = NULL;
+static uint32_t audio_dump_data_bytes = 0;
+static uint16_t audio_dump_channels = 1;
+
+#define BEEPER_EVENT_CAPACITY 8192
+
+typedef struct BeeperEvent {
+    uint64_t t_state;
+    int8_t level;
+} BeeperEvent;
+
+static BeeperEvent beeper_events[BEEPER_EVENT_CAPACITY];
+static size_t beeper_event_head = 0;
+static size_t beeper_event_tail = 0;
+static uint64_t beeper_last_event_t_state = 0;
+static double beeper_cycles_per_sample = 0.0;
+static double beeper_playback_position = 0.0;
+static double beeper_writer_cursor = 0.0;
+static double beeper_hp_last_input = 0.0;
+static double beeper_hp_last_output = 0.0;
+static int beeper_playback_level = 0;
+static int beeper_latency_warning_active = 0;
+static int beeper_idle_log_active = 0;
+static uint64_t beeper_idle_reset_count = 0;
 // --- Audio Callback ---
 void audio_callback(void* userdata, uint8_t* stream, int len) {
     (void)userdata;
@@ -936,8 +1061,7 @@ void audio_callback(void* userdata, uint8_t* stream, int len) {
                 if (!beeper_idle_log_active) {
                     double idle_ms = (idle_cycles / CPU_CLOCK_HZ) * 1000.0;
                     BEEPER_LOG(
-                        "[BEEPER] idle reset #%llu after %.0f samples (idle %.2f ms, playback %.0f -> %.0f cycles, writer %llu, cursor %.0f, lag %.2f samples)
-",
+                        "[BEEPER] idle reset #%llu after %.0f samples (idle %.2f ms, playback %.0f -> %.0f cycles, writer %llu, cursor %.0f, lag %.2f samples)\n",
                         (unsigned long long)(beeper_idle_reset_count + 1u),
                         idle_samples,
                         idle_ms,
@@ -999,51 +1123,8 @@ void audio_callback(void* userdata, uint8_t* stream, int len) {
 }
 
 
-static void ula_queue_port_value(uint8_t value);
-static void ula_process_port_events(uint64_t current_t_state);
-
-static FILE* audio_dump_file = NULL;
-static uint32_t audio_dump_data_bytes = 0;
-static uint16_t audio_dump_channels = 1;
-
-#define BEEPER_EVENT_CAPACITY 8192
-
-typedef struct {
-    uint64_t t_state;
-    int8_t level;
-} BeeperEvent;
-
-static BeeperEvent beeper_events[BEEPER_EVENT_CAPACITY];
-static size_t beeper_event_head = 0;
-static size_t beeper_event_tail = 0;
-static uint64_t beeper_last_event_t_state = 0;
-static double beeper_cycles_per_sample = 0.0;
-static double beeper_playback_position = 0.0;
-static double beeper_writer_cursor = 0.0;
-static double beeper_hp_last_input = 0.0;
-static double beeper_hp_last_output = 0.0;
-static int beeper_playback_level = 0;
-static int beeper_latency_warning_active = 0;
-static int beeper_idle_log_active = 0;
-static uint64_t beeper_idle_reset_count = 0;
-static int beeper_logging_enabled = 0;
-
-#define BEEPER_LOG(...)                                              \
-    do {                                                             \
-        if (beeper_logging_enabled) {                                \
-            fprintf(stderr, __VA_ARGS__);                            \
-        }                                                            \
-    } while (0)
-
 static size_t beeper_pending_event_count(void);
 static void beeper_force_resync(uint64_t sync_t_state);
-
-// --- Timing Globals ---
-uint64_t total_t_states = 0; // A global clock for the entire CPU
-
-// --- ZX Spectrum Colours ---
-const uint32_t spectrum_colors[8] = {0x000000FF,0x0000CDFF,0xCD0000FF,0xCD00CDFF,0x00CD00FF,0x00CDCDFF,0xCDCD00FF,0xCFCFCFFF};
-const uint32_t spectrum_bright_colors[8] = {0x000000FF,0x0000FFFF,0xFF0000FF,0xFF00FFFF,0x00FF00FF,0x00FFFFFF,0xFFFF00FF,0xFFFFFFFF};
 
 #if defined(ESP_PLATFORM)
 static uint16_t video_rgba_to_rgb565(uint32_t rgba)
@@ -1809,35 +1890,6 @@ typedef struct Z80 {
 } Z80;
 
 
-// --- Function Prototypes ---
-uint8_t readByte(uint16_t addr); void writeByte(uint16_t addr, uint8_t val);
-uint16_t readWord(uint16_t addr); void writeWord(uint16_t addr, uint16_t val);
-uint8_t io_read(uint16_t port); void io_write(uint16_t port, uint8_t value);
-int cpu_step(Z80* cpu); int init_lcd_backend(void); void cleanup_lcd_backend(void); void render_screen(void);
-int cpu_interrupt(Z80* cpu, uint8_t data_bus);
-int cpu_nmi(Z80* cpu);
-int cpu_ddfd_cb_step(Z80* cpu, uint16_t* index_reg, int is_ix);
-void audio_callback(void* userdata, uint8_t* stream, int len);
-static void border_record_event(uint64_t event_t_state, uint8_t color_idx);
-static void border_draw_span(uint64_t span_start, uint64_t span_end, uint8_t color_idx);
-static void spectrum_map_page(int segment, SpectrumMemoryPageType type, uint8_t index);
-static void spectrum_refresh_visible_ram(void);
-static void spectrum_apply_memory_configuration(void);
-static void spectrum_update_contention_flags(void);
-static inline int ula_contention_penalty(uint64_t t_state);
-static void beeper_reset_audio_state(uint64_t current_t_state, int current_level);
-static void beeper_set_latency_limit(double sample_limit);
-static void beeper_push_event(uint64_t t_state, int level);
-static size_t beeper_catch_up_to(double catch_up_position, double playback_position_snapshot);
-static double beeper_current_latency_samples(void);
-static double beeper_latency_threshold(void);
-static uint32_t beeper_recommended_throttle_delay(double latency_samples);
-static int audio_dump_start(const char* path, uint32_t sample_rate, uint16_t channels);
-static void audio_dump_write_samples(const Sint16* samples, size_t count);
-static void audio_dump_finish(void);
-static void audio_dump_abort(void);
-
-
 // --- ROM Utilities ---
 static char *build_executable_relative_path(const char *executable_path, const char *filename) {
     if (!executable_path || !filename) {
@@ -2281,19 +2333,6 @@ void writeWord(uint16_t addr, uint16_t val) {
     writeByte((uint16_t)(addr + 1u), hi);
 }
 
-// --- I/O Port Access Helpers ---
-uint8_t border_color_idx = 0;
-
-typedef struct {
-    uint64_t t_state;
-    uint8_t color_idx;
-} BorderColorEvent;
-
-static BorderColorEvent border_color_events[BORDER_EVENT_CAPACITY];
-static size_t border_color_event_count = 0;
-static uint64_t border_frame_start_tstate = 0;
-static uint8_t border_frame_color = 0;
-
 static void beeper_reset_audio_state(uint64_t current_t_state, int current_level) {
     beeper_event_head = 0;
     beeper_event_tail = 0;
@@ -2592,7 +2631,7 @@ static void tape_log_block_summary(const TapeBlock* block, size_t index) {
     switch (block->type) {
         case TAPE_BLOCK_TYPE_STANDARD:
         case TAPE_BLOCK_TYPE_TURBO:
-        case TAPE_BLOCK_TYPE_PURE_DATA:
+        case TAPE_BLOCK_TYPE_PURE_DATA: {
             if (!block->data || block->length == 0) {
                 tape_log(" (empty)\n");
                 return;
@@ -2649,6 +2688,7 @@ static void tape_log_block_summary(const TapeBlock* block, size_t index) {
 
             tape_log("\n");
             return;
+        }
         case TAPE_BLOCK_TYPE_PURE_TONE:
             tape_log(" tone pulses=%u length=%u\n",
                      (unsigned)block->tone_pulse_count,
@@ -8148,7 +8188,7 @@ static int tape_recorder_finalize_block(uint64_t current_t_state, int force_flus
 
     size_t pulse_count = tape_recorder.pulse_count;
     if (tape_recorder.output_format == TAPE_OUTPUT_TAP && pulse_count >= 100) {
-        TapeBlock block = {0};
+        TapeBlock block = {TAPE_BLOCK_TYPE_STANDARD};
         if (!tape_decode_pulses_to_block(tape_recorder.pulses, pulse_count, pause_ms, &block)) {
             fprintf(stderr, "Warning: failed to decode saved tape block (%zu pulses)\n", pulse_count);
         } else {
@@ -10733,7 +10773,7 @@ static int snapshot_fixture_generate_base64(const char* filename, const char* ou
 }
 
 static void snapshot_fixture_fill_standard_header(uint8_t header[27]) {
-    static const uint8_t template[27] = {
+    static const uint8_t snapshot_header_template[27] = {
         0x3F,       // I
         0x22, 0x11, // HL'
         0x44, 0x33, // DE'
@@ -10751,7 +10791,7 @@ static void snapshot_fixture_fill_standard_header(uint8_t header[27]) {
         0x02,       // IM
         0x04        // Border colour
     };
-    memcpy(header, template, sizeof(template));
+    memcpy(header, snapshot_header_template, sizeof(snapshot_header_template));
 }
 
 static int snapshot_fixture_write_ram_block(FILE* out, uint8_t value, size_t size) {
@@ -11607,3 +11647,7 @@ static void ula_process_port_events(uint64_t current_t_state) {
 
     ula_write_count = 0;
 }
+
+void emulator_setup(void) {}
+
+void emulator_loop(void) {}
