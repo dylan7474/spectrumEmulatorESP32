@@ -47,14 +47,16 @@ check_arduino_core() {
         return
     fi
 
-    if arduino-cli core list --format json 2>/dev/null | grep -q '"ID"\s*:\s*"esp32:esp32"'; then
+    if arduino-cli core list --format json 2>/dev/null |
+        grep -qi '"id"[[:space:]]*:[[:space:]]*"esp32:esp32"'; then
         print_status 0 "arduino-cli esp32 core installed"
     else
         print_status 1 "arduino-cli esp32 core not installed"
         warn=1
     fi
 
-    if arduino-cli lib list --format json 2>/dev/null | grep -qi '"Name"\s*:\s*"TFT_eSPI"'; then
+    if arduino-cli lib list --format json 2>/dev/null |
+        grep -qi '"name"[[:space:]]*:[[:space:]]*"TFT_eSPI"'; then
         print_status 0 "arduino-cli TFT_eSPI library installed"
     else
         print_status 1 "arduino-cli TFT_eSPI library not installed"
